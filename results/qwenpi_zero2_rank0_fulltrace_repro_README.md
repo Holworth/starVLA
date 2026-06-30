@@ -5,6 +5,7 @@
 - 小文件/代码通过 GitHub fork 同步。
 - 大文件 artifact 通过 Hugging Face repo 同步。
 - 接收方在任意 `$WORKDIR` 下拉取并复现。
+- 不依赖原始机器的 `/home/chenchaox/project/phyai_fd` 路径。
 
 目标 profile：
 
@@ -21,9 +22,42 @@ profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143/
 - profiling：8 个训练 rank 都启动，只有 rank 0 被 `nsys` 包住。
 - `PROFILE_RANKS=0` 表示只 profile rank0，不是单卡训练。
 
-## 1. 远端源
+## 0. 当前交付状态
 
-把下面两个变量替换成实际地址：
+截至 2026-06-30，代码和 artifact 已同步到下面两个远端：
+
+| 项 | 值 |
+|---|---|
+| GitHub fork | `https://github.com/chenchaoxu7575/starVLA.git` |
+| GitHub branch | `qwenpi-zero2-profile-handoff-20260630` |
+| GitHub commit | `887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc` |
+| HF artifact repo | `https://huggingface.co/datasets/chenchaoxNV/qwenpi-zero2-profile-artifacts` |
+| HF repo type | `dataset` |
+| Primary `.nsys-rep` | `profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143.rank0.nsys-rep` |
+
+GitHub branch 是 starVLA fork 本身，不是另一个空壳 handoff repo。该 branch
+在 upstream starVLA 源码基础上额外包含本次 profile 需要的小文件：
+
+```text
+scripts/starvla/
+containers/starvla-profile/build.sh
+results/qwenpi_zero2_rank0_fulltrace_repro_README.md
+results/qwenpi_zero2_profile_handoff_core.sha256
+```
+
+Hugging Face dataset repo 存放不适合进 GitHub 的大文件：
+
+```text
+containers/starvla-profile/starvla.sqsh
+tools/nsight-systems/
+data/starvla_libero/
+profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143/
+results/qwenpi_zero2_profile_handoff_core.sha256
+```
+
+## 1. 远端变量
+
+后续命令默认使用这些变量：
 
 ```bash
 export GITHUB_REPO=https://github.com/chenchaoxu7575/starVLA.git
@@ -31,15 +65,6 @@ export GITHUB_REF=qwenpi-zero2-profile-handoff-20260630
 export HF_REPO_ID=chenchaoxNV/qwenpi-zero2-profile-artifacts
 export HF_REPO_TYPE=dataset
 ```
-
-Current HF artifact repo:
-
-```text
-https://huggingface.co/datasets/chenchaoxNV/qwenpi-zero2-profile-artifacts
-```
-
-The GitHub handoff branch is based on the starVLA fork and includes the local
-profile harness in addition to upstream starVLA source.
 
 推荐远端职责：
 
@@ -83,14 +108,16 @@ model/swift_output/                            # ms-swift 旧实验输出，约 
 code/starVLA/playground/                       # 本机临时/数据目录，约 16G
 ```
 
-## 3. 生产者：同步到 GitHub fork
+## 3. GitHub fork 内容
 
-在原始工作区准备 GitHub fork。目标是让接收方 clone 后拥有这些小文件：
+本次已经把 profile harness 提交到 `chenchaoxu7575/starVLA` 的 handoff branch。
+接收方 clone 该 branch 后，repo 根目录应包含这些小文件：
 
 ```text
 scripts/starvla/
 containers/starvla-profile/build.sh
 results/qwenpi_zero2_rank0_fulltrace_repro_README.md
+results/qwenpi_zero2_profile_handoff_core.sha256
 ```
 
 同时确保 starVLA 源码固定在本次 commit：
@@ -101,100 +128,18 @@ branch: starVLA_dev
 commit: cdf5434438f4449cff85e3588956f7706a5c9cc3
 ```
 
-如果你的 fork 是完整 handoff repo，建议在 repo 根目录保留本实验目录布局：
+handoff branch 的最终 commit 是：
 
 ```text
-code/starVLA/
-scripts/starvla/
-containers/starvla-profile/build.sh
-results/qwenpi_zero2_rank0_fulltrace_repro_README.md
+887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc
 ```
 
-如果你的 fork 只是 starVLA fork，则需要把 profile harness 也提交进去，比如：
+因此接收方可以直接把 fork clone 到 `$WORKDIR` 根目录，不需要再额外准备
+`code/starVLA`。launcher 会自动识别 starVLA fork 根目录布局。
 
-```text
-scripts/starvla/
-containers/starvla-profile/build.sh
-```
+## 4. Hugging Face artifact 内容
 
-接收方只要 clone 到 `$WORKDIR` 后能看到这些相对路径即可。
-
-## 4. 生产者：同步到 Hugging Face
-
-登录 Hugging Face：
-
-```bash
-huggingface-cli login
-```
-
-创建 private dataset repo，或者用已有 repo：
-
-```bash
-huggingface-cli repo create "$HF_REPO_ID" --type dataset --private
-```
-
-从原始机器上传大文件。下面命令假设原始工作区是：
-
-```bash
-export SRC_WORKDIR=/home/chenchaox/project/phyai_fd
-cd "$SRC_WORKDIR"
-```
-
-上传已构建容器：
-
-```bash
-huggingface-cli upload "$HF_REPO_ID" \
-  containers/starvla-profile/starvla.sqsh \
-  containers/starvla-profile/starvla.sqsh \
-  --repo-type "$HF_REPO_TYPE"
-```
-
-上传 Nsight Systems CLI：
-
-```bash
-huggingface-cli upload "$HF_REPO_ID" \
-  tools/nsight-systems \
-  tools/nsight-systems \
-  --repo-type "$HF_REPO_TYPE"
-```
-
-上传数据：
-
-```bash
-huggingface-cli upload "$HF_REPO_ID" \
-  data/starvla_libero \
-  data/starvla_libero \
-  --repo-type "$HF_REPO_TYPE"
-```
-
-上传本次 profile artifact：
-
-```bash
-huggingface-cli upload "$HF_REPO_ID" \
-  profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143 \
-  profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143 \
-  --repo-type "$HF_REPO_TYPE"
-```
-
-上传 checksum：
-
-```bash
-huggingface-cli upload "$HF_REPO_ID" \
-  results/qwenpi_zero2_profile_handoff_core.sha256 \
-  results/qwenpi_zero2_profile_handoff_core.sha256 \
-  --repo-type "$HF_REPO_TYPE"
-```
-
-如果需要同步精确的本地 Qwen checkpoint，而不是让接收方从官方 Qwen repo 下载：
-
-```bash
-huggingface-cli upload "$HF_REPO_ID" \
-  model/pretrained/Qwen3.5-4B \
-  model/pretrained/Qwen3.5-4B \
-  --repo-type "$HF_REPO_TYPE"
-```
-
-核心 checksum 已在本工作区生成：
+核心 checksum 文件：
 
 ```text
 results/qwenpi_zero2_profile_handoff_core.sha256
@@ -207,6 +152,9 @@ containers/starvla-profile/starvla.sqsh
 tools/nsight-systems/downloads/NsightSystems-linux-cli-public-2026.3.1.157-3804839.deb
 profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143.rank0.nsys-rep
 ```
+
+该 checksum 只覆盖核心大文件，不覆盖完整数据目录。数据目录通过 `test -d`
+和训练启动时的数据加载来验证。
 
 ## 5. 接收方：拉取代码和 artifact
 
@@ -224,6 +172,13 @@ cd "$WORKDIR"
 ```bash
 git clone "$GITHUB_REPO" .
 git checkout "$GITHUB_REF"
+git rev-parse HEAD
+```
+
+`git rev-parse HEAD` 应输出：
+
+```text
+887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc
 ```
 
 如果你选择把 starVLA clone 到 `code/starVLA`，也可以，但需要从同一个 branch
@@ -286,6 +241,7 @@ cd "$WORKDIR"
 
 test -f containers/starvla-profile/starvla.sqsh
 test -x scripts/starvla/profile_qwenpi_zero2_single_node.sh
+test -f starVLA/training/train_starvla.py
 test -f model/pretrained/Qwen3.5-4B/config.json
 test -d data/starvla_libero/libero_goal_no_noops_1.0.0_lerobot
 test -x tools/nsight-systems/extract/opt/nvidia/nsight-systems-cli/2026.3.1/target-linux-x64/nsys
@@ -328,13 +284,17 @@ export ENROOT_NAME=starvla-qwenpi
 ```bash
 cd "$WORKDIR"
 
+WORKDIR_PARENT="$(dirname "$WORKDIR")"
+WORKDIR_NAME="$(basename "$WORKDIR")"
+
 ENROOT_MOUNT_HOME=no enroot start --rw \
-  --mount "$WORKDIR/code:/code" \
+  --env WORKDIR_NAME="$WORKDIR_NAME" \
+  --mount "$WORKDIR_PARENT:/code" \
   --mount "$WORKDIR/model:/model" \
   --mount "$WORKDIR/scripts:/scripts" \
   --mount "$WORKDIR/tools/nsight-systems/extract/opt/nvidia/nsight-systems-cli:/opt/nvidia/nsight-systems" \
   "${ENROOT_NAME:-starvla}" bash -lc '
-    cd /code/starVLA
+    cd "/code/${WORKDIR_NAME}"
     python --version
     python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
     /opt/nvidia/nsight-systems/2026.3.1/target-linux-x64/nsys --version
@@ -371,7 +331,7 @@ docker://pytorch/pytorch:2.6.0-cuda12.4-cudnn9-devel
 
 - `enroot import` base image。
 - 创建/更新 enroot 容器 `starvla`。
-- 在容器中对 `code/starVLA` 执行依赖安装。
+- 在容器中对当前 starVLA fork checkout 执行依赖安装。
 - 安装 `starVLA` editable package。
 - 导出 `containers/starvla-profile/starvla.sqsh`。
 
