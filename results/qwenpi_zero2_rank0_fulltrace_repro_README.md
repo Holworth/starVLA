@@ -30,7 +30,7 @@ profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143/
 |---|---|
 | GitHub fork | `https://github.com/chenchaoxu7575/starVLA.git` |
 | GitHub branch | `qwenpi-zero2-profile-handoff-20260630` |
-| GitHub commit | `887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc` |
+| Profile harness commit | `887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc` |
 | HF artifact repo | `https://huggingface.co/datasets/chenchaoxNV/qwenpi-zero2-profile-artifacts` |
 | HF repo type | `dataset` |
 | Primary `.nsys-rep` | `profiles/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143/qwenpi_zero2_rank0_fulltrace_2step_nsys2026_20260628_2143.rank0.nsys-rep` |
@@ -128,11 +128,14 @@ branch: starVLA_dev
 commit: cdf5434438f4449cff85e3588956f7706a5c9cc3
 ```
 
-handoff branch 的最终 commit 是：
+profile harness 首次进入 handoff branch 的 commit 是：
 
 ```text
 887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc
 ```
+
+该 branch 可能会继续有 README-only 更新。复现时以 branch HEAD 为准，但需要确认
+HEAD 包含上面的 profile harness commit。
 
 因此接收方可以直接把 fork clone 到 `$WORKDIR` 根目录，不需要再额外准备
 `code/starVLA`。launcher 会自动识别 starVLA fork 根目录布局。
@@ -172,14 +175,11 @@ cd "$WORKDIR"
 ```bash
 git clone "$GITHUB_REPO" .
 git checkout "$GITHUB_REF"
-git rev-parse HEAD
+git merge-base --is-ancestor 887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc HEAD
 ```
 
-`git rev-parse HEAD` 应输出：
-
-```text
-887616d9e2fa2bfccb2d31ca1ba9159b890a9dcc
-```
+`git merge-base --is-ancestor ... HEAD` 退出码为 0 即表示当前 checkout 包含
+本次 profile harness。
 
 如果你选择把 starVLA clone 到 `code/starVLA`，也可以，但需要从同一个 branch
 把 `scripts/`、`containers/`、`results/` 同步到 `$WORKDIR` 根目录：
