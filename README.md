@@ -14,6 +14,10 @@
 
 > **📢 Citation Update:** Our technical report is now on arXiv ([2604.05014](https://arxiv.org/abs/2604.05014)). We kindly invite you to use the [updated BibTeX](#citation) for any ongoing or future citations. If you have already cited StarVLA in a previous version of your work, we would greatly appreciate it if you could update the citation entry in your camera-ready or future revisions. Thank you for your understanding and support! 🙏
 
+> **QwenPI profile handoff:** This branch includes the reproducible QwenPI
+> ZeRO-2 Nsight Systems 2026.3.1 profile handoff. See
+> [docs/qwenpi_zero2_profile_handoff.md](docs/qwenpi_zero2_profile_handoff.md).
+
 ---
 
 In StarVLA (also a pun on "start VLA" ),  each functional component (model, data, trainer, config, evaluation, etc.) follows a top-down, intuitive separation and high-cohesion, low-coupling principle, enabling plug-and-play design, rapid prototyping, and independent debugging.

@@ -1,5 +1,9 @@
 # QwenPI ZeRO-2 Nsight Profile 远端同步与复现说明
 
+GitHub 上的主文档是
+[`docs/qwenpi_zero2_profile_handoff.md`](../docs/qwenpi_zero2_profile_handoff.md)。
+本文件保留在 `results/` 下，方便与 Hugging Face artifact tree 的相对路径对齐。
+
 本文档面向**不能访问原始机器**的同事。默认交付方式：
 
 - 小文件/代码通过 GitHub fork 同步。
