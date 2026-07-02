@@ -49,6 +49,9 @@ NSYS_KILL="${NSYS_KILL:-sigterm}"
 NSYS_CUDA_MEMORY_USAGE="${NSYS_CUDA_MEMORY_USAGE:-false}"
 NSYS_START_STAGGER_SEC="${NSYS_START_STAGGER_SEC:-0}"
 ENROOT_NAME="${ENROOT_NAME:-starvla}"
+# Optional NCCL protocol override (e.g. NCCL_PROTO=Simple). Left unset by
+# default so NCCL keeps auto-selecting; only touched when the caller asks.
+NCCL_PROTO="${NCCL_PROTO:-}"
 
 OUT_DIR="${OUT_DIR:-${PROJ}/profiles/${RUN_ID}}"
 OUT_BASE="${OUT_DIR}/${RUN_ID}"
@@ -57,6 +60,19 @@ OUT_BASE_IN="${OUT_DIR_IN}/${RUN_ID}"
 LOG_FILE="${OUT_BASE}.command.log"
 
 mkdir -p "${OUT_DIR}"
+
+# Build the NCCL_PROTO override as an optional --env arg (array, so it's
+# simply absent -- not an empty NCCL_PROTO="" -- when unset) plus a re-export
+# run right before accelerate launch. The container's `bash -lc` login shell
+# sources /etc/profile & friends, and NGC/PyTorch base images sometimes bake
+# in their own NCCL_* defaults there, which would otherwise silently clobber
+# whatever `enroot --env` set before the profile scripts even ran.
+EXTRA_ENV_ARGS=()
+NCCL_PROTO_EXPORT_CMD=""
+if [[ -n "${NCCL_PROTO}" ]]; then
+  EXTRA_ENV_ARGS+=(--env "NCCL_PROTO=${NCCL_PROTO}")
+  NCCL_PROTO_EXPORT_CMD="export NCCL_PROTO=${NCCL_PROTO} && "
+fi
 
 cat >"${OUT_BASE}.cmd" <<EOF
 ENROOT_NAME=${ENROOT_NAME} ENROOT_MOUNT_HOME=no enroot start --rw ... ${ENROOT_NAME} bash -lc 'accelerate launch --no_python ... /scripts/starvla/nsys_rank_wrapper.sh ...'
@@ -74,6 +90,7 @@ EOF
   echo "nsys_capture_range_end=${NSYS_CAPTURE_RANGE_END} kill=${NSYS_KILL}"
   echo "nsys_cuda_memory_usage=${NSYS_CUDA_MEMORY_USAGE}"
   echo "nsys_start_stagger_sec=${NSYS_START_STAGGER_SEC}"
+  echo "nccl_proto=${NCCL_PROTO:-<unset, NCCL auto-selects>}"
   echo "enroot_name=${ENROOT_NAME}"
   echo "starvla_src_host=${STARVLA_SRC_HOST}"
   echo "starvla_src_in=${STARVLA_SRC_IN}"
@@ -102,6 +119,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env STARVLA_NSYS_KILL="${NSYS_KILL}" \
   --env STARVLA_NSYS_CUDA_MEMORY_USAGE="${NSYS_CUDA_MEMORY_USAGE}" \
   --env STARVLA_NSYS_START_STAGGER_SEC="${NSYS_START_STAGGER_SEC}" \
+  "${EXTRA_ENV_ARGS[@]}" \
   --mount "${NSYS_HOST_DIR}:/opt/nvidia/nsight-systems" \
   --mount "${CODE_MOUNT_HOST}:/code" \
   --mount "${PROJ}/model:/model" \
@@ -109,6 +127,8 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --mount "${PROJ}/data/starvla_libero:/sv_data" \
   --mount "${PROJ}/scripts:/scripts" \
   "${ENROOT_NAME}" bash -lc "cd ${STARVLA_SRC_IN} && \
+    ${NCCL_PROTO_EXPORT_CMD}echo '--- NCCL_* env right before accelerate launch ---'; \
+    env | grep -i '^NCCL_' || true; \
     ${NSYS_BIN} --version && \
     set +e; \
     accelerate launch \
