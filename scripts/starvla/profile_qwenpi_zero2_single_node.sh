@@ -49,9 +49,13 @@ NSYS_KILL="${NSYS_KILL:-sigterm}"
 NSYS_CUDA_MEMORY_USAGE="${NSYS_CUDA_MEMORY_USAGE:-false}"
 NSYS_START_STAGGER_SEC="${NSYS_START_STAGGER_SEC:-0}"
 ENROOT_NAME="${ENROOT_NAME:-starvla}"
-# Optional NCCL protocol override (e.g. NCCL_PROTO=Simple). Left unset by
-# default so NCCL keeps auto-selecting; only touched when the caller asks.
+# Optional NCCL overrides (e.g. NCCL_PROTO=Simple, NCCL_ALGO=NVLS). Left unset
+# by default so NCCL keeps auto-selecting; only touched when the caller asks.
 NCCL_PROTO="${NCCL_PROTO:-}"
+NCCL_ALGO="${NCCL_ALGO:-}"
+NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-}"
+LOGGING_FREQ="${LOGGING_FREQ:-1}"
+EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
 
 OUT_DIR="${OUT_DIR:-${PROJ}/profiles/${RUN_ID}}"
 OUT_BASE="${OUT_DIR}/${RUN_ID}"
@@ -69,10 +73,17 @@ mkdir -p "${OUT_DIR}"
 # whatever `enroot --env` set before the profile scripts even ran.
 EXTRA_ENV_ARGS=()
 NCCL_PROTO_EXPORT_CMD=""
-if [[ -n "${NCCL_PROTO}" ]]; then
-  EXTRA_ENV_ARGS+=(--env "NCCL_PROTO=${NCCL_PROTO}")
-  NCCL_PROTO_EXPORT_CMD="export NCCL_PROTO=${NCCL_PROTO} && "
-fi
+# NCCL_P2P_LEVEL: required on split-topology boxes (e.g. h200-nvl 4+4 quads
+# joined only by SYS paths) where default cross-quad P2P/CUMEM silently never
+# delivers and the first collective hangs; NCCL_P2P_LEVEL=NVL keeps P2P inside
+# each NVLink island and falls back to SHM across.
+for nccl_var in NCCL_PROTO NCCL_ALGO NCCL_NVLS_ENABLE NCCL_P2P_LEVEL NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_BUFFSIZE STARVLA_COLLATE_TIMING STARVLA_DEFER_AG; do
+  nccl_val="${!nccl_var:-}"
+  if [[ -n "${nccl_val}" ]]; then
+    EXTRA_ENV_ARGS+=(--env "${nccl_var}=${nccl_val}")
+    NCCL_PROTO_EXPORT_CMD+="export ${nccl_var}=${nccl_val} && "
+  fi
+done
 
 cat >"${OUT_BASE}.cmd" <<EOF
 ENROOT_NAME=${ENROOT_NAME} ENROOT_MOUNT_HOME=no enroot start --rw ... ${ENROOT_NAME} bash -lc 'accelerate launch --no_python ... /scripts/starvla/nsys_rank_wrapper.sh ...'
@@ -91,6 +102,8 @@ EOF
   echo "nsys_cuda_memory_usage=${NSYS_CUDA_MEMORY_USAGE}"
   echo "nsys_start_stagger_sec=${NSYS_START_STAGGER_SEC}"
   echo "nccl_proto=${NCCL_PROTO:-<unset, NCCL auto-selects>}"
+  echo "nccl_algo=${NCCL_ALGO:-<unset>} nccl_nvls_enable=${NCCL_NVLS_ENABLE:-<unset>}"
+  echo "logging_freq=${LOGGING_FREQ} extra_train_args=${EXTRA_TRAIN_ARGS:-<none>}"
   echo "enroot_name=${ENROOT_NAME}"
   echo "starvla_src_host=${STARVLA_SRC_HOST}"
   echo "starvla_src_in=${STARVLA_SRC_IN}"
@@ -105,6 +118,9 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env WANDB_MODE=disabled --env PYTHONWARNINGS=ignore \
   --env HF_HOME=/model/huggingface --env HF_HUB_CACHE=/model/huggingface/hub \
   --env PYTHONPATH=/scripts/starvla \
+  --env NCCL_DEBUG=INFO \
+  --env NCCL_DEBUG_SUBSYS=INIT,ENV,TUNING \
+  --env NCCL_DEBUG_FILE="${OUT_DIR_IN}/nccl_debug.%h.%p.log" \
   --env STARVLA_PROFILE_START_STEP="${PROFILE_START_STEP}" \
   --env STARVLA_PROFILE_END_STEP="${PROFILE_END_STEP}" \
   --env STARVLA_PROFILE_TRIGGER="${NSYS_CAPTURE_MODE}" \
@@ -147,9 +163,9 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --trainer.max_train_steps ${MAX_STEPS} \
       --trainer.eval_interval 100000 \
       --trainer.save_interval 100000 \
-      --trainer.logging_frequency 1 \
+      --trainer.logging_frequency ${LOGGING_FREQ} \
       --run_root_dir /tmp/ck \
-      --run_id ${RUN_ID}; \
+      --run_id ${RUN_ID} ${EXTRA_TRAIN_ARGS}; \
     status=\$?; \
     echo accelerate_exit_status=\${status}; \
     /scripts/starvla/collect_rank_nsys_stats.sh ${OUT_BASE_IN}; \
