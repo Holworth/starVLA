@@ -14,6 +14,9 @@ if os.environ.get("STARVLA_DEFER_AG"):
 if os.environ.get("STARVLA_FUSED_TEXT_STACK"):
     import fused_text_stack_patch  # noqa: F401  ([OPT #14/#15] fused text stack groups + fused vision tower)
 
+if os.environ.get("STARVLA_GRAD_COPY_STREAM"):
+    import ds_grad_copy_stream_patch  # noqa: F401  ([OPT #18] ZeRO-2 bucket-fill copies on a side stream)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_yaml", type=str, required=True)
 args, clip = parser.parse_known_args()

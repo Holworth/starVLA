@@ -432,10 +432,23 @@ live in `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`, not the KERNEL table).
   combo once with the stock path first; embeds-only (generation) input falls
   back to stock.
 
+- **[OPT #18] ZeRO-2 bucket-fill copies on a side stream**
+  (`STARVLA_GRAD_COPY_STREAM=1`, run I): defers the per-param grad->bucket
+  copies to a dedicated stream (torch._foreach_copy_ flush before each
+  reduce; ordering chained into DS's existing average_tensor cross-syncs).
+  MEASURED NEUTRAL: 287.9 ms vs H mean 288.5 — the 12 ms window between
+  backward graphs turns out to be dominated by the ~445 python gradient-hook
+  invocations (~25 us each of host time) that must run before the CPU can
+  launch the next graph; the GPU-side copies it removes were inside that
+  host-bound span. Kept env-gated (default off) as a documented experiment.
+  The real lever for that window is compiled autograd (fold hook logic into
+  the backward graph) or per-bucket instead of per-param hooks in DeepSpeed.
+
 Cumulative: original ~800 ms (80 samples/s) → committed 423.8 (151) →
 **~288 ms (~222 samples/s), 2.8x, bs8 spec-compliant, target 200 met.**
-Remaining levers: NCCL wire floor (~96 ms), DiT/optimizer segment,
-remaining preamble glue (patch-embed/pos-embed interpolate, merger).
+Remaining levers: NCCL wire floor (~96 ms), the per-param gradient-hook
+python burst (~11 ms, see #18), DiT/optimizer segment, remaining preamble
+glue (patch-embed/pos-embed interpolate, merger).
 
 ## Files touched
 
