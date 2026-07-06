@@ -326,6 +326,102 @@ at the step boundary (`timing/data` ≈ 50 ms = the optimizer tail the CPU now
 waits on inside `next(dataloader)`); wall-clock regression over steps 21-100
 is the only honest end-to-end number.
 
+## Round 8 (2026-07-05, h200-nvl 4u8g-gen-0029): torch 2.7 exploration & fused-stack groundwork
+
+Node change: viking-cr-196 went SLURM-draining; this round ran on an H200 NVL
+box with a split 4+4 NVLink topology (comm 12x slower, `NCCL_P2P_LEVEL=NVL`
+mandatory — see the handoff doc). Numbers from this round are NOT comparable
+with viking; its lasting outputs are mechanisms, not ms:
+
+- torch 2.7.1 + NCCL 2.26 stack: -13% on that box (1751→1520 ms).
+- `fused_text_stack_patch.py`: 32 text layers compiled in groups. Blocked on
+  stock fla by `@torch.compiler.disable` graph breaks x cudagraph_trees
+  allocator checkpointing x ZeRO-2 hook allocations (crashes on torch 2.6 AND
+  2.7.1; fla-core 0.5.1 still ships the disable). STARVLA_FLA_TRACE=1 fixes
+  it: remove the decorator (container edit) + constant-fold
+  `check_shared_mem`/`get_multiprocessor_count` → break-free single graph per
+  group, verified fullgraph fwd+bwd.
+- Whole-stack single graph measured WORSE than groups: a monolithic backward
+  graph releases all 7.5B gradients only at graph end, killing ZeRO-2
+  comm/compute overlap. Groups of 8 (4 graphs) are the sweet spot.
+
+## Round 9 (2026-07-06, viking-prod-260): validation + fused vision — **~298 ms / 211-218 samples/s at bs8, customer 200 target crossed**
+
+Fresh viking-class node (H200 SXM, full NVLink). All numbers = timing/model
+mean over steps 21-60, 60-step runs, run-to-run spread ±9 ms.
+
+| run | config | ms/step | samples/s |
+|---|---|---|---|
+| A | committed best (torch 2.6, items 1-11) | 422.5 | 151.5 — reproduces 423.8/151.0 |
+| B | A + [OPT #12] MRoPE precompute | 415.9 | 153.9 |
+| C | [OPT #13] torch 2.7.1 stack | 367.7 | 174.1 |
+| D | C + [OPT #14] fused text stack g8 | 336.1 / 353.8 | ~185 |
+| F | D + [OPT #16] reduce_bucket 1.5e9 | 341.3 / 344.7 | ~186 (variance 17.7→3.4 ms) |
+| G | F + [OPT #15] fused vision tower | **302.3 / 294.2** | **211.7 / 217.6** |
+
+Item details and LIMITATIONS:
+
+- **[OPT #12] MRoPE position-id precompute** (`collate_mrope_posids`):
+  compute the (3,B,T) 3D position ids on CPU in DataLoader workers via a
+  weightless Qwen3_5Model shim + exact-key per-sample cache (keys:
+  mm_token_type_ids row, attention_mask row, grid bytes — HF never reads
+  token values), ship them in qwen_inputs; HF skips its per-step
+  compute_3d_position_ids (python loop + 3x .item()/image + .tolist()/row).
+  -6.6 ms on the per-layer stack; NEUTRAL on the fused stack (the phase
+  overlaps better there). Verified bitwise vs HF (unit + in-vivo
+  STARVLA_CHECK_POSIDS across 8 ranks). Limitations: Qwen3.5-only
+  (model_type-gated — Qwen2.5-VL has time_interval=4 mrope semantics and
+  would silently corrupt), requires preprocess_in_collate, works on the
+  customer-pinned torch 2.6 stack (only deviation-free item this round).
+- **[OPT #13] torch 2.7.1 stack**: -55 ms (-13%) even on full NVLink (triton
+  3.3 TMA fla kernels + inductor). Limitations: DEVIATES from the
+  Agibot-pinned versions — torch 2.6.0→2.7.1, flash_attn
+  2.7.4.post1→2.8.0.post2 (ABI), causal-conv1d 1.5.0.post8→1.5.2 (ABI) —
+  needs customer sign-off; container-level change, not in this repo.
+- **[OPT #14] fused text stack, groups of 8** (`STARVLA_FUSED_TEXT_STACK=1
+  STARVLA_FLA_TRACE=1 STARVLA_FUSED_GROUP_SIZE=8`, compile_language_model
+  false): -22 ms of inter-graph glue (hooks, per-graph input copies, eager
+  fla launches). Limitations: requires #13 + the container fla edit
+  (untested on torch 2.6); training path only (cache/generation falls back
+  to stock HF); STATIC SHAPES required — collate_pad_to fixed,
+  per-GPU batch size constant through the run (any constant bs works, 8 and
+  16 both fine; what breaks CUDA Graphs is shape VARIATION, not a specific
+  bs — avoid partial last batches / dynamic seq); group size trades glue vs
+  ZeRO-2 overlap (1 graph = worst, 8 = sweet spot, ~matches VLM grad bucket
+  count); gradient checkpointing path falls back.
+- **[OPT #15] fused vision tower** (`STARVLA_FUSED_VISION=1`): 24 ViT blocks
+  + FA2 varlen in ONE reduce-overhead graph. Unblocked by two host-constant
+  folds: (a) max_seqlen (GPU 0-dim tensor vs flash custom-op SymInt) → cached
+  host int per image_grid_thw; (b) transformers lazy_import_flash_attention
+  (importlib at call time) → prewarmed dict. -45 ms, the single biggest item
+  this round. Limitations: verified on torch 2.7.1 + flash_attn 2.8.0.post2
+  ONLY (the old 2.6 + 2.7.4 stack hard-fails on the flash custom op); fixed
+  camera resolutions assumed — each distinct image_grid_thw costs one
+  recompile + graph re-capture (fine for a handful of camera setups, wrong
+  workload shape for arbitrary-resolution data); vision
+  output_hidden_states/attentions falls back to eager; grid tensor takes one
+  tiny D2H per step for the cache key (replaces the .item() sync the eager
+  flash path already paid).
+- **[OPT #16] reduce_bucket_size 1e9→1.5e9**: DiT head (2.985B params, FIRST
+  gradients out in backward) now fills exactly 2 ipg buckets = DeepSpeed's
+  two ping-pong overlap buffers (`stage_1_and_2.py` swaps `ipg_index`
+  between 0/1); at 1e9 the third DiT bucket could stall autograd waiting for
+  a free buffer on skew-heavy steps. Mean-neutral (343.0 vs 345.0) but
+  variance collapsed (range 17.7→3.4 ms). Limitation: the value is COUPLED
+  to the action-head size — if the DiT param count changes, retune so the
+  head's gradients fill ≤2 buckets.
+
+Profiles: `profiles/milestone3` (config F) and `profiles/milestone4`
+(config G) on HF `qihankang/startVLA_profile`, both captured with the new
+`NSYS_CUDA_GRAPH_TRACE=node` knob (per-kernel visibility inside CUDA
+graphs; analysis note — with the default `graph` mode, in-graph kernels
+live in `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`, not the KERNEL table).
+
+Cumulative: original ~800 ms (80 samples/s) → committed 423.8 (151) →
+**~298 ms (211-218 samples/s), 2.7x, bs8 spec-compliant, target 200 met.**
+Remaining levers: NCCL wire floor (~96 ms), DiT/optimizer segment,
+preamble/merger eager glue.
+
 ## Files touched
 
 - `starVLA/config/deepseeds/ds_config.yaml` — timers section
