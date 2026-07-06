@@ -48,6 +48,8 @@ NSYS_CAPTURE_RANGE_END="${NSYS_CAPTURE_RANGE_END:-stop}"
 NSYS_KILL="${NSYS_KILL:-sigterm}"
 NSYS_CUDA_MEMORY_USAGE="${NSYS_CUDA_MEMORY_USAGE:-false}"
 NSYS_START_STAGGER_SEC="${NSYS_START_STAGGER_SEC:-0}"
+# graph = opaque CUDA-graph blocks (low overhead); node = per-kernel visibility
+NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-graph}"
 ENROOT_NAME="${ENROOT_NAME:-starvla}"
 # Optional NCCL overrides (e.g. NCCL_PROTO=Simple, NCCL_ALGO=NVLS). Left unset
 # by default so NCCL keeps auto-selecting; only touched when the caller asks.
@@ -77,7 +79,7 @@ NCCL_PROTO_EXPORT_CMD=""
 # joined only by SYS paths) where default cross-quad P2P/CUMEM silently never
 # delivers and the first collective hangs; NCCL_P2P_LEVEL=NVL keeps P2P inside
 # each NVLink island and falls back to SHM across.
-for nccl_var in NCCL_PROTO NCCL_ALGO NCCL_NVLS_ENABLE NCCL_P2P_LEVEL NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_BUFFSIZE STARVLA_COLLATE_TIMING STARVLA_DEFER_AG; do
+for nccl_var in NCCL_PROTO NCCL_ALGO NCCL_NVLS_ENABLE NCCL_P2P_LEVEL NCCL_MIN_NCHANNELS NCCL_MAX_NCHANNELS NCCL_BUFFSIZE STARVLA_COLLATE_TIMING STARVLA_DEFER_AG STARVLA_FUSED_TEXT_STACK STARVLA_FUSED_COMPILE_MODE STARVLA_FUSED_GROUP_SIZE STARVLA_FLA_TRACE STARVLA_FUSED_VISION STARVLA_CHECK_POSIDS; do
   nccl_val="${!nccl_var:-}"
   if [[ -n "${nccl_val}" ]]; then
     EXTRA_ENV_ARGS+=(--env "${nccl_var}=${nccl_val}")
@@ -134,6 +136,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env STARVLA_NSYS_CAPTURE_RANGE_END="${NSYS_CAPTURE_RANGE_END}" \
   --env STARVLA_NSYS_KILL="${NSYS_KILL}" \
   --env STARVLA_NSYS_CUDA_MEMORY_USAGE="${NSYS_CUDA_MEMORY_USAGE}" \
+  --env STARVLA_NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE}" \
   --env STARVLA_NSYS_START_STAGGER_SEC="${NSYS_START_STAGGER_SEC}" \
   "${EXTRA_ENV_ARGS[@]}" \
   --mount "${NSYS_HOST_DIR}:/opt/nvidia/nsight-systems" \

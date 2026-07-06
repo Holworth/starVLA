@@ -13,6 +13,10 @@ nvtx_capture="${STARVLA_NSYS_NVTX_CAPTURE:-profile_window}"
 capture_end="${STARVLA_NSYS_CAPTURE_RANGE_END:-stop}"
 kill_signal="${STARVLA_NSYS_KILL:-sigterm}"
 cuda_memory_usage="${STARVLA_NSYS_CUDA_MEMORY_USAGE:-false}"
+# "graph" (nsys default, low overhead): CUDA-graph executions are opaque
+# blocks (kernels land in CUPTI_ACTIVITY_KIND_GRAPH_TRACE, not KERNEL).
+# "node": per-kernel visibility inside graphs — larger trace, slight overhead.
+cuda_graph_trace="${STARVLA_NSYS_CUDA_GRAPH_TRACE:-graph}"
 profile_ranks="${STARVLA_PROFILE_RANKS:-all}"
 
 mkdir -p "${out_dir}"
@@ -41,6 +45,7 @@ if [[ "${should_profile}" == "1" ]]; then
     --trace="${trace}"
     --sample=none --cpuctxsw=none
     --cuda-memory-usage="${cuda_memory_usage}"
+    --cuda-graph-trace="${cuda_graph_trace}"
     --export=sqlite
     --output "${out_base}"
   )
