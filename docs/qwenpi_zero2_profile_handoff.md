@@ -1,5 +1,11 @@
 # QwenPI ZeRO-2 Nsight Profile Handoff
 
+> **Update 2026-07-03:** the 2-step trace described here is dominated by
+> step-1 Triton compilation (the 44.6% `FillFunctor<int>` entry is 99.9% a
+> warmup artifact). For steady-state results (`MAX_STEPS=100`) and the
+> current optimization roadmap, see
+> `docs/qwenpi_zero2_h200_steady_state_profile.md`.
+
 This document is for reproducing and inspecting the QwenPI Nsight Systems
 profile without access to the original profiling host.
 
@@ -366,6 +372,27 @@ containers/starvla-profile/starvla.sqsh
 
 Rebuilding requires network access to the container registry, PyPI, and GitHub.
 It also builds `flash-attn` inside the container.
+
+## Profiling Host Change (2026-07-05)
+
+All optimization-round numbers and the `qwenpi_milestone1` / `qwenpi_milestone2`
+profiles were captured on `viking-cr-196` (H200 SXM, 8-GPU all-to-all NVLink,
+NCCL 24 channels, AR busbw 472 GB/s). That node entered SLURM `draining` state
+and current allocations land on `h200-nvl` boxes (e.g. `4u8g-gen-0029`) with a
+**split 4+4 topology**: GPU0-3 and GPU4-7 are NVLink cliques (NV6), the two
+quads are joined only by cross-socket PCIe (`SYS` in `nvidia-smi topo -m`).
+
+Consequences on the h200-nvl boxes:
+
+1. **Default NCCL hangs.** NCCL connects cross-quad rings via P2P/CUMEM, the
+   DMA writes silently never deliver, and the very first 4-byte allreduce
+   blocks until the 30-min watchdog kills the job. Set `NCCL_P2P_LEVEL=NVL`
+   (forwarded by the profile script) so P2P stays inside each quad and
+   cross-quad traffic falls back to SHM.
+2. **Comm is ~12x slower.** Microbench AR busbw is 38.5 GB/s vs 472 GB/s on
+   viking-cr-196, so step times are NOT comparable with the report/milestone
+   numbers; `qwenpi_milestone3` (captured on `4u8g-gen-0029`) is the baseline
+   for this node class only.
 
 ## Known Notes
 
