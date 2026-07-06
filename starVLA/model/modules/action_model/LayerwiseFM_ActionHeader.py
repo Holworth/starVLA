@@ -241,6 +241,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         self.input_embedding_dim = diffusion_model_cfg_kwargs["input_embedding_dim"]
         self.model = DiT(**diffusion_model_cfg_kwargs)  # TODO: ideally copy LLM init from VLM
+        # [OPT #4, docs/qwenpi_zero2_h200_final_report.md; compile_mode also
+        # drives #9 max-autotune / #10 CUDA Graphs] Opt-in torch.compile of
+        # the DiT transformer (framework.action_model.compile_dit). The head
+        # is launch-bound (~1000 fwd kernels for 32 blocks); shapes are static
+        # once the encoder sequence is padded to a fixed length
+        # (framework.action_model.pad_encoder_seq_to, handled by the framework).
+        if str(action_config.get("compile_dit", False)).lower() in ("true", "1"):
+            compile_mode = action_config.get("compile_mode", None) or None
+            self.model = torch.compile(self.model, dynamic=False, mode=compile_mode)
         self.dit_out_hidden_size = self.input_embedding_dim
         self.action_dim = action_config.action_dim
         # `action_horizon` is the canonical chunk length.  Legacy YAMLs are
