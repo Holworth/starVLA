@@ -417,10 +417,25 @@ Profiles: `profiles/milestone3` (config F) and `profiles/milestone4`
 graphs; analysis note — with the default `graph` mode, in-graph kernels
 live in `CUPTI_ACTIVITY_KIND_GRAPH_TRACE`, not the KERNEL table).
 
+| H | G + #12 enabled + [OPT #17] sync-free merge | **292.0 / 285.0** | **218.8 / 224.4** |
+
+- **[OPT #17] sync-free multimodal merge** (`STARVLA_FAST_MM_MERGE=1` + the
+  linear-attn-mask sync skip inside the fused preamble): milestone4 step-40
+  showed ~150 tiny D2H syncs (12 KB total!) in the 16 ms gap between the
+  vision graph and the first text-stack graph — the in-model MRoPE compute
+  (removed by enabling #12, which the G config had left off) plus
+  get_placeholder_mask's count-validation (bool-mask gather + host bool())
+  plus _update_linear_attn_mask's torch.all readback. The fast path keeps
+  the mask math (async GPU) and drops the validation/branch syncs.
+  Limitations: a genuine placeholder/feature count mismatch surfaces as a
+  shifted scatter instead of a clean error — validate the collate/processor
+  combo once with the stock path first; embeds-only (generation) input falls
+  back to stock.
+
 Cumulative: original ~800 ms (80 samples/s) → committed 423.8 (151) →
-**~298 ms (211-218 samples/s), 2.7x, bs8 spec-compliant, target 200 met.**
+**~288 ms (~222 samples/s), 2.8x, bs8 spec-compliant, target 200 met.**
 Remaining levers: NCCL wire floor (~96 ms), DiT/optimizer segment,
-preamble/merger eager glue.
+remaining preamble glue (patch-embed/pos-embed interpolate, merger).
 
 ## Files touched
 

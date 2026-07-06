@@ -225,7 +225,12 @@ def _fused_forward(
         past_key_values=None,
         position_ids=text_position_ids,
     )
-    linear_attn_mask = self._update_linear_attn_mask(attention_mask, cache_position)
+    # [OPT #17] HF's _update_linear_attn_mask runs torch.all(attention_mask==1)
+    # in an `if` — a per-step GPU->CPU sync just to swap the mask for None as
+    # an all-visible optimization. With left padding to collate_pad_to that
+    # case never triggers, and passing the mask when it IS all-ones is still
+    # correct (just not the fast path), so skip the sync entirely.
+    linear_attn_mask = attention_mask
 
     cos, sin = self.rotary_emb(inputs_embeds, position_ids)
 
@@ -380,3 +385,44 @@ def _patch_vision_tower():
 if os.environ.get("STARVLA_FUSED_VISION"):
     _patch_vision_tower()
     print("[fused_text_stack_patch] vision tower fused (STARVLA_FUSED_VISION)", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# [OPT #17] Sync-free multimodal embedding merge (STARVLA_FAST_MM_MERGE=1).
+#
+# HF's Qwen3_5Model.get_placeholder_mask validates that the number of image
+# placeholder tokens matches the vision features via
+# `inputs_embeds[special_image_mask].numel() == image_features.numel()` — a
+# boolean-mask gather (cub DeviceSelect) followed by a host bool() readback,
+# i.e. one more CPU<->GPU round trip per modality per step, sitting exactly
+# in the exposed gap between the vision graph and the first text-stack graph
+# (milestone4 step-40: ~150 tiny D2H syncs in 16 ms there, shared with the
+# in-model MRoPE compute that [OPT #12] removes).
+#
+# The fast path keeps the mask computation (pure GPU, async) and DROPS the
+# validation. Trade-off: a genuine token/feature count mismatch would surface
+# as a shifted masked_scatter instead of a clean error — enable only with a
+# processor/collate combination that has been validated once (e.g. with the
+# stock path or STARVLA_CHECK_POSIDS runs).
+# ---------------------------------------------------------------------------
+
+
+def _patch_mm_merge():
+    def _fast_placeholder_mask(self, input_ids, inputs_embeds, image_features=None, video_features=None):
+        if input_ids is None:
+            # embeds-only path is generation-oriented; keep stock behavior
+            return _orig_placeholder_mask(self, input_ids, inputs_embeds,
+                                          image_features=image_features, video_features=video_features)
+        special_image_mask = (input_ids == self.config.image_token_id)
+        special_video_mask = (input_ids == self.config.video_token_id)
+        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds)
+        return special_image_mask, special_video_mask
+
+    _orig_placeholder_mask = _m.Qwen3_5Model.get_placeholder_mask
+    _m.Qwen3_5Model.get_placeholder_mask = _fast_placeholder_mask
+
+
+if os.environ.get("STARVLA_FAST_MM_MERGE"):
+    _patch_mm_merge()
+    print("[fused_text_stack_patch] sync-free mm merge (STARVLA_FAST_MM_MERGE)", flush=True)
