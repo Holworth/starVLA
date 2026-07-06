@@ -11,6 +11,9 @@ import nvtx_patch  # noqa: F401  (导入即生效,必须在 T 之后)
 if os.environ.get("STARVLA_DEFER_AG"):
     import ds_defer_allgather_patch  # noqa: F401  (ZeRO-2 tail allgather overlapped with forward)
 
+if os.environ.get("STARVLA_FUSED_TEXT_STACK"):
+    import fused_text_stack_patch  # noqa: F401  ([OPT #14/#15] fused text stack groups + fused vision tower)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_yaml", type=str, required=True)
 args, clip = parser.parse_known_args()
