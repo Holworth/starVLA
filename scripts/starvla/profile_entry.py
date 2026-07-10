@@ -17,6 +17,9 @@ if os.environ.get("STARVLA_FUSED_TEXT_STACK"):
 if os.environ.get("STARVLA_GRAD_COPY_STREAM"):
     import ds_grad_copy_stream_patch  # noqa: F401  ([OPT #18] ZeRO-2 bucket-fill copies on a side stream)
 
+if os.environ.get("STARVLA_COMPILED_AUTOGRAD"):
+    import compiled_autograd_patch  # noqa: F401  ([EXP A2] dynamo-captured backward incl. ZeRO-2 hooks)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_yaml", type=str, required=True)
 args, clip = parser.parse_known_args()
