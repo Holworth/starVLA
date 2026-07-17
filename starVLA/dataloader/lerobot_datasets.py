@@ -21,6 +21,146 @@ logger = logging.getLogger(__name__)
 def collate_fn(batch):
     return batch
 
+
+class QwenVLPreprocessCollate:
+    """[OPT #3, docs/qwenpi_zero2_h200_final_report.md] Run the HF Qwen-VL
+    processor inside DataLoader workers (opt-in).
+
+    The default identity collate ships raw PIL images + strings to the main
+    process, which then spends ~40 ms/step of GPU-idle time running the
+    processor inside model.forward. Doing it here overlaps that CPU work with
+    the previous step's GPU execution, and pin_memory=True becomes effective
+    because the batch is now a dict of CPU tensors.
+
+    Enabled via ``datasets.vla_data.preprocess_in_collate: true``; consumed by
+    ``Qwen_PI.forward`` which accepts this dict batch alongside the legacy
+    list-of-examples format.
+    """
+
+    def __init__(
+        self, processor, cot_prompt=None, pixel_dtype=None, keep_examples=False, pad_to=0
+    ):
+        self.processor = processor
+        self.cot_prompt = cot_prompt
+        self.pixel_dtype = pixel_dtype
+        # [OPT #6/#10] Pad token sequences to a fixed length (left padding) so
+        # downstream torch.compile(dynamic=False) / CUDA Graphs see static
+        # shapes. 0 = batch-dynamic.
+        self.pad_to = int(pad_to or 0)
+        # Shipping the raw PIL examples through the worker queue costs extra
+        # pickle/unpickle time per batch; only keep them when a consumer (e.g.
+        # eval_action_model) actually needs the raw batch.
+        self.keep_examples = keep_examples
+
+    def __call__(self, batch):
+        import numpy as np
+        import torch
+        import os as _os
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        messages = []
+        for ex in batch:
+            content = [{"type": "image", "image": img} for img in ex["image"]]
+            instruction = ex["lang"]
+            prompt = (
+                self.cot_prompt.replace("{instruction}", instruction)
+                if self.cot_prompt
+                else instruction
+            )
+            content.append({"type": "text", "text": prompt})
+            messages.append([{"role": "user", "content": content}])
+
+        pad_kwargs = (
+            {"padding": "max_length", "max_length": self.pad_to}
+            if self.pad_to
+            else {"padding": True}
+        )
+        # qwen_inputs = the HF processor's full output, a dict of pure torch
+        # tensors: input_ids / attention_mask / mm_token_type_ids [B, T]
+        # (left-padded to pad_to when set), pixel_values (patch sequences of
+        # ALL images in the batch, optionally pre-cast to bf16 below) and
+        # image_grid_thw [n_images, 3]. No raw PIL.Image / str survives past
+        # this point - Qwen_PI.forward's fast branch just splats this dict
+        # into the VLM after H2D.
+        qwen_inputs = dict(
+            self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                return_tensors="pt",
+                **pad_kwargs,
+            )
+        )
+        if self.pixel_dtype is not None and "pixel_values" in qwen_inputs:
+            qwen_inputs["pixel_values"] = qwen_inputs["pixel_values"].to(self.pixel_dtype)
+
+        out = {
+            "qwen_inputs": qwen_inputs,
+            "actions": torch.from_numpy(np.stack([np.asarray(ex["action"]) for ex in batch])),
+        }
+        if self.keep_examples:
+            out["examples"] = batch
+        if "state" in batch[0]:
+            out["state"] = torch.from_numpy(np.stack([np.asarray(ex["state"]) for ex in batch]))
+        if _os.environ.get("STARVLA_COLLATE_TIMING"):
+            print(
+                f"[collate] pid={_os.getpid()} t={_time.perf_counter():.3f} "
+                f"dur={(_time.perf_counter()-_t0)*1000:.1f}ms",
+                flush=True,
+            )
+        return out
+
+
+def build_preprocess_collate(cfg, default=None):
+    """[OPT #3] Dispatch for the opt-in worker-side preprocessing collate.
+
+    Pure dispatch, no model-family specifics: returns ``default`` (the
+    identity collate) when ``datasets.vla_data.preprocess_in_collate`` is
+    disabled or the configured backbone has no preprocessing collate
+    implemented; otherwise delegates to the per-family builder. Adding a
+    new backbone = one more dispatch arm here + its build_*_collate.
+    """
+    vla_dataset_cfg = cfg.datasets.vla_data
+    if str(vla_dataset_cfg.get("preprocess_in_collate", False)).lower() not in ("true", "1"):
+        return default
+    # Qwen-VL family: frameworks carrying a ``qwenvl`` config section.
+    if "qwenvl" in cfg.framework:
+        return build_qwenvl_preprocess_collate(cfg)
+    logger.warning(
+        "[dataloader] preprocess_in_collate=true but no preprocessing collate "
+        "is implemented for this backbone; falling back to the default collate"
+    )
+    return default
+
+
+def build_qwenvl_preprocess_collate(cfg):
+    """Construct the Qwen-VL worker-side preprocessing collate from config
+    (see QwenVLPreprocessCollate for what it does per batch)."""
+    import torch
+    from transformers import AutoProcessor
+
+    vla_dataset_cfg = cfg.datasets.vla_data
+    processor = AutoProcessor.from_pretrained(cfg.framework.qwenvl.base_vlm)
+    processor.tokenizer.padding_side = "left"
+    cot_prompt = vla_dataset_cfg.get("CoT_prompt", None) if "CoT_prompt" in vla_dataset_cfg else None
+    pixel_dtype = (
+        torch.bfloat16
+        if str(vla_dataset_cfg.get("collate_pixels_bf16", True)).lower() in ("true", "1")
+        else None
+    )
+    keep_examples = str(vla_dataset_cfg.get("collate_keep_examples", False)).lower() in ("true", "1")
+    logger.info("[dataloader] preprocess_in_collate enabled: HF processor runs in DataLoader workers")
+    return QwenVLPreprocessCollate(
+        processor,
+        cot_prompt=cot_prompt,
+        pixel_dtype=pixel_dtype,
+        keep_examples=keep_examples,
+        pad_to=int(vla_dataset_cfg.get("collate_pad_to", 0) or 0),
+    )
+
+
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,

@@ -45,10 +45,19 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
         )
 
+        # [OPT #3, docs/qwenpi_zero2_h200_final_report.md] Opt-in fast collate
+        # (HF preprocessing in workers). Model-family specifics live in the
+        # build_preprocess_collate factory, not here: it returns the right
+        # preprocessing collate for the configured backbone (currently
+        # Qwen-VL) or falls back to the identity collate_fn.
+        from starVLA.dataloader.lerobot_datasets import build_preprocess_collate
+
+        chosen_collate = build_preprocess_collate(cfg, default=collate_fn)
+
         num_workers = int(vla_dataset_cfg.get("num_workers", 4))
         dataloader_kwargs = {
             "batch_size": cfg.datasets.vla_data.per_device_batch_size,
-            "collate_fn": collate_fn,
+            "collate_fn": chosen_collate,
             "num_workers": num_workers,
             "pin_memory": bool(vla_dataset_cfg.get("pin_memory", True)),
             # shuffle=True
