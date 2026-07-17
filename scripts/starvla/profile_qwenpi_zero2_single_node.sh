@@ -31,6 +31,9 @@ GRAD_ACCUM="${GRAD_ACCUM:-1}"
 # DiT precision (framework.action_model.dit_dtype): bf16 = the measured config,
 # none = single-switch rollback to the caller's fp32 (pre-optimization behavior).
 DIT_DTYPE="${DIT_DTYPE:-bf16}"
+# MRoPE position-id cache (framework.qwenvl.mrope_posid_cache): true = the
+# measured config, MROPE_CACHE=false rolls back to HF per-step compute.
+MROPE_CACHE="${MROPE_CACHE:-true}"
 PROFILE_START_STEP="${PROFILE_START_STEP:-${START_STEP:-11}}"
 PROFILE_END_STEP="${PROFILE_END_STEP:-${END_STEP:-13}}"
 if (( PROFILE_END_STEP < PROFILE_START_STEP )); then
@@ -92,6 +95,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env WANDB_MODE=disabled --env PYTHONWARNINGS=ignore \
   --env HF_HOME=/model/huggingface --env HF_HUB_CACHE=/model/huggingface/hub \
   --env PYTHONPATH=/scripts/starvla \
+  --env STARVLA_CHECK_POSIDS="${STARVLA_CHECK_POSIDS:-}" \
   --env STARVLA_PROFILE_START_STEP="${PROFILE_START_STEP}" \
   --env STARVLA_PROFILE_END_STEP="${PROFILE_END_STEP}" \
   --env STARVLA_PROFILE_TRIGGER="${NSYS_CAPTURE_MODE}" \
@@ -136,6 +140,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --datasets.vla_data.preprocess_in_collate true \
       --datasets.vla_data.num_workers 8 \
       --datasets.vla_data.collate_pad_to 192 \
+      --framework.qwenvl.mrope_posid_cache ${MROPE_CACHE} \
       --run_root_dir /tmp/ck \
       --run_id ${RUN_ID}; \
     status=\$?; \
