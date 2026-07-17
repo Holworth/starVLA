@@ -3,6 +3,7 @@
 # Modification: [rm and add some connect adapter to match with starVLA, e.g., "rm "].
 
 
+import contextlib
 from dataclasses import dataclass, field
 
 import torch
@@ -241,6 +242,30 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         self.input_embedding_dim = diffusion_model_cfg_kwargs["input_embedding_dim"]
         self.model = DiT(**diffusion_model_cfg_kwargs)  # TODO: ideally copy LLM init from VLM
+        # DiT numeric precision knob (framework.action_model.dit_dtype):
+        # unset/none = keep the caller's precision context (the framework wraps
+        # this head in fp32 autocast, so the DiT runs fp32 — pre-optimization
+        # behavior); "bf16"/"fp16" run just the DiT transformer call under a
+        # reduced-precision autocast (tensor-core GEMMs, backward included via
+        # the saved reduced-precision tensors). Loss/velocity math stays in the
+        # caller's fp32 either way. Single-switch rollback: drop the config key.
+        _dit_dtypes = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "fp32": torch.float32,
+            "float32": torch.float32,
+        }
+        _raw = str(action_config.get("dit_dtype", "") or "").lower()
+        if _raw in ("", "none", "null"):
+            self.dit_autocast_dtype = None
+        elif _raw in _dit_dtypes:
+            self.dit_autocast_dtype = _dit_dtypes[_raw]
+        else:
+            raise ValueError(
+                f"framework.action_model.dit_dtype: unknown value '{_raw}' (expected none/bf16/fp16/fp32)"
+            )
         self.dit_out_hidden_size = self.input_embedding_dim
         self.action_dim = action_config.action_dim
         # `action_horizon` is the canonical chunk length.  Legacy YAMLs are
@@ -284,6 +309,13 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
     def prepare_input(self, batch: dict) -> BatchFeature:
         return BatchFeature(data=batch)
+
+    def _dit_autocast(self):
+        """Precision context for DiT calls, per framework.action_model.dit_dtype
+        (see __init__). None = inherit the caller's precision context."""
+        if self.dit_autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast("cuda", dtype=self.dit_autocast_dtype)
 
     def forward(
         self,
@@ -330,13 +362,22 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
 
         # Layer-wise DiT forward. DiT handles cross/self-attention interleaving.
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs_list,
-            timestep=t_discretized,
-            encoder_attention_mask=encoder_attention_mask,
-            return_pre_output=True,
-        )
+        # The caller wraps this whole forward() in a float32 autocast (needed for the
+        # noise/velocity arithmetic above and the loss below), but that also forces the
+        # DiT's internal Linear/Attention matmuls onto slow fp32 GEMM paths instead of
+        # bf16 tensor cores. dit_dtype=bf16 re-enables tensor cores for just the
+        # transformer call (backward included, via the saved bf16 tensors): LayerNorm
+        # stays fp32 under autocast's own op whitelist, and TimestepEncoder.forward()
+        # explicitly casts to its own parameter dtype regardless of the ambient
+        # autocast, so this is safe and matches how the VLM backbone already runs.
+        with self._dit_autocast():
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs_list,
+                timestep=t_discretized,
+                encoder_attention_mask=encoder_attention_mask,
+                return_pre_output=True,
+            )
 
         # Decode only the action-token positions.
         pred = self.action_decoder(model_output)
@@ -391,14 +432,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 else torch.cat((future_tokens, action_features), dim=1)
             )
 
-            # Layer-wise DiT forward. DiT handles cross/self-attention interleaving.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs_list,
-                timestep=timesteps_tensor,
-                encoder_attention_mask=encoder_attention_mask,
-                return_pre_output=True,
-            )
+            # Layer-wise DiT forward. See forward() above; inference-only path,
+            # same dit_dtype knob so eval numerics match training.
+            with self._dit_autocast():
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs_list,
+                    timestep=timesteps_tensor,
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_pre_output=True,
+                )
             # Decode only the action-token positions.
             pred = self.action_decoder(model_output)
             pred_velocity = pred[:, -self.action_horizon :]
@@ -481,12 +524,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 if state_features is not None
                 else torch.cat((future_tokens, action_features), dim=1)
             )
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs_list,
-                timestep=timesteps,
-                return_pre_output=True,
-            )
+            # See forward() above for why this needs its own bf16 autocast rather than
+            # inheriting the caller's fp32 context.
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs_list,
+                    timestep=timesteps,
+                    return_pre_output=True,
+                )
             pred = self.action_decoder(model_output)
             return pred[:, -self.action_horizon :]
 
@@ -607,12 +653,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     device=device,
                     dtype=torch.long,
                 )
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs_list,
-                    timestep=temb_tensor,
-                    return_pre_output=True,
-                )
+                # See forward() above; inference-only path, same dit_dtype knob
+                # so realtime-serving numerics match training.
+                with self._dit_autocast():
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embs_list,
+                        timestep=temb_tensor,
+                        return_pre_output=True,
+                    )
 
                 pred = self.action_decoder(model_output)
                 pred_velocity = pred[:, -self.action_horizon :]
