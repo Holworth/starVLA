@@ -76,6 +76,13 @@ class QwenVLPreprocessCollate:
             if self.pad_to
             else {"padding": True}
         )
+        # qwen_inputs = the HF processor's full output, a dict of pure torch
+        # tensors: input_ids / attention_mask / mm_token_type_ids [B, T]
+        # (left-padded to pad_to when set), pixel_values (patch sequences of
+        # ALL images in the batch, optionally pre-cast to bf16 below) and
+        # image_grid_thw [n_images, 3]. No raw PIL.Image / str survives past
+        # this point - Qwen_PI.forward's fast branch just splats this dict
+        # into the VLM after H2D.
         qwen_inputs = dict(
             self.processor.apply_chat_template(
                 messages,

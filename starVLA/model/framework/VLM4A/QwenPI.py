@@ -202,8 +202,21 @@ class Qwen_PI(baseframework):
             dict:
                 action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
         """
-        # [OPT #3] Pre-collated dict batch: the HF processor already ran in
-        # DataLoader workers, forward starts launching kernels immediately.
+        # [OPT #3] Two input formats, selected by how the DataLoader was
+        # configured (datasets.vla_data.preprocess_in_collate):
+        # (A) pre-collated dict from QwenVLPreprocessCollate (this branch):
+        #     {"qwen_inputs": HF-processor output as pure CPU tensors
+        #      (input_ids / attention_mask / mm_token_type_ids [B, T],
+        #      pixel_values, image_grid_thw), "actions": tensor,
+        #      optional "state": tensor}. The HF processor already ran inside
+        #     the DataLoader workers, so the main thread only does H2D copies
+        #     + the VLM forward.
+        # (B) legacy list-of-dicts (else branch): raw PIL images + str
+        #     instructions; the HF processor runs HERE, on the training
+        #     critical path, inside _encode_vl_hidden_states.
+        # Both branches meet the same contract for Step 4 below: vl_embs_list
+        # (last N layer hidden states), backbone_attention_mask, and
+        # actions/state as device tensors in base_hidden's dtype.
         if isinstance(examples, dict) and "qwen_inputs" in examples:
             # Pre-collated path: only H2D copies + VLM forward on the main thread.
             device = self.qwen_vl_interface.model.device
@@ -212,6 +225,10 @@ class Qwen_PI(baseframework):
                 for k, v in examples["qwen_inputs"].items()
             }
             backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+            # Same bf16 autocast the legacy path applies inside
+            # _encode_vl_hidden_states: the VLM backbone loads and trains in
+            # bf16 (DeepSpeed bf16 mode); only the execution site of the HF
+            # preprocessing differs between the two branches, not precision.
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 qwenvl_outputs = self.qwen_vl_interface(
                     **qwen_inputs,
@@ -235,6 +252,11 @@ class Qwen_PI(baseframework):
             # Step 1: encode through QwenVL
             vl_embs_list, backbone_attention_mask = self._encode_vl_hidden_states(batch_images, instructions)
             base_hidden = vl_embs_list[-1]
+            # The actions/state tensor conversion moved here VERBATIM from
+            # Step 4 below: branch (A) already receives device tensors, and
+            # re-wrapping a CUDA tensor in torch.tensor(np.array(...)) would
+            # force a GPU->CPU sync plus an extra copy. Each branch now hands
+            # Step 4 ready device tensors.
             actions = torch.tensor(
                 np.array(actions_list), device=base_hidden.device, dtype=base_hidden.dtype
             )  # [B, T_full, action_dim]
