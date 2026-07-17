@@ -22,6 +22,39 @@ def collate_fn(batch):
     return batch
 
 
+class HostPinnedBatch:
+    """[OPT #7, docs/qwenpi_zero2_h200_final_report.md] Opaque batch container
+    for the fast QwenPI path.
+
+    Deliberately NOT a Mapping/sequence and has NO ``.to`` method, so
+    accelerate's ``DataLoaderShard.send_to_device`` passes it through
+    untouched — its blocking default-stream H2D would otherwise serialize
+    behind the ZeRO-2 optimizer tail (param allgather + Adam, ~50 ms/step).
+    Defines ``pin_memory()`` so the DataLoader pin thread still pins the
+    tensors (torch's pin loop calls it on objects that expose it).
+    ``Qwen_PI.forward`` unwraps ``.data`` and moves tensors to device on a
+    dedicated copy stream, overlapping the optimizer tail.
+    """
+
+    __slots__ = ("data",)
+
+    def __init__(self, data):
+        self.data = data
+
+    def pin_memory(self):
+        import torch
+
+        def _pin(x):
+            if isinstance(x, torch.Tensor):
+                return x.pin_memory()
+            if isinstance(x, dict):
+                return {k: _pin(v) for k, v in x.items()}
+            return x
+
+        self.data = _pin(self.data)
+        return self
+
+
 class QwenVLPreprocessCollate:
     """[OPT #3, docs/qwenpi_zero2_h200_final_report.md] Run the HF Qwen-VL
     processor inside DataLoader workers (opt-in).
@@ -38,7 +71,7 @@ class QwenVLPreprocessCollate:
     """
 
     def __init__(
-        self, processor, cot_prompt=None, pixel_dtype=None, keep_examples=False, pad_to=0
+        self, processor, cot_prompt=None, pixel_dtype=None, keep_examples=False, pad_to=0, host_batch=False
     ):
         self.processor = processor
         self.cot_prompt = cot_prompt
@@ -47,6 +80,8 @@ class QwenVLPreprocessCollate:
         # downstream torch.compile(dynamic=False) / CUDA Graphs see static
         # shapes. 0 = batch-dynamic.
         self.pad_to = int(pad_to or 0)
+        # Wrap the batch in HostPinnedBatch (see class docstring).
+        self.host_batch = bool(host_batch)
         # Shipping the raw PIL examples through the worker queue costs extra
         # pickle/unpickle time per batch; only keep them when a consumer (e.g.
         # eval_action_model) actually needs the raw batch.
@@ -110,6 +145,8 @@ class QwenVLPreprocessCollate:
                 f"dur={(_time.perf_counter()-_t0)*1000:.1f}ms",
                 flush=True,
             )
+        if self.host_batch:
+            return HostPinnedBatch(out)
         return out
 
 
@@ -158,6 +195,7 @@ def build_qwenvl_preprocess_collate(cfg):
         pixel_dtype=pixel_dtype,
         keep_examples=keep_examples,
         pad_to=int(vla_dataset_cfg.get("collate_pad_to", 0) or 0),
+        host_batch=str(vla_dataset_cfg.get("collate_host_batch", False)).lower() in ("true", "1"),
     )
 
 

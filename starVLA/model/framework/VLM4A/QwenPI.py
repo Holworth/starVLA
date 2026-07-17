@@ -202,22 +202,68 @@ class Qwen_PI(baseframework):
             dict:
                 action_loss (torch.Tensor): Scalar diffusion noise prediction loss.
         """
+        # [OPT #7, docs/qwenpi_zero2_h200_final_report.md] HostPinnedBatch
+        # (duck-typed to avoid a dataloader import): pinned CPU tensors that
+        # accelerate did NOT move. Copy them on a dedicated stream so the H2D
+        # overlaps the previous step's ZeRO-2 optimizer tail instead of
+        # queueing behind it on the default stream.
+        if hasattr(examples, "data") and isinstance(getattr(examples, "data"), dict) and "qwen_inputs" in examples.data:
+            batch = examples.data
+            device = self.qwen_vl_interface.model.device
+            if not hasattr(self, "_h2d_stream"):
+                self._h2d_stream = torch.cuda.Stream(device=device)
+            cur_stream = torch.cuda.current_stream(device)
+            moved = []
+            with torch.cuda.stream(self._h2d_stream):
+                qwen_inputs = {}
+                for k, v in batch["qwen_inputs"].items():
+                    if not torch.is_tensor(v):
+                        qwen_inputs[k] = v
+                    else:
+                        g = v.to(device, non_blocking=True)
+                        moved.append(g)
+                        qwen_inputs[k] = g
+                actions = batch["actions"].to(device, non_blocking=True)
+                moved.append(actions)
+                state = batch.get("state", None)
+                if state is not None:
+                    state = state.to(device, non_blocking=True)
+                    moved.append(state)
+            cur_stream.wait_stream(self._h2d_stream)
+            for g in moved:
+                g.record_stream(cur_stream)
+
+            backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                qwenvl_outputs = self.qwen_vl_interface(
+                    **qwen_inputs,
+                    output_attentions=False,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                expected_layers = len(self.action_model.model.transformer_blocks)
+                vl_embs_list = list(qwenvl_outputs.hidden_states[-expected_layers:])
+            base_hidden = vl_embs_list[-1]
+            actions = actions.to(base_hidden.dtype)
+            if state is not None:
+                state = state.to(base_hidden.dtype)
         # [OPT #3] Two input formats, selected by how the DataLoader was
         # configured (datasets.vla_data.preprocess_in_collate):
-        # (A) pre-collated dict from QwenVLPreprocessCollate (this branch):
-        #     {"qwen_inputs": HF-processor output as pure CPU tensors
-        #      (input_ids / attention_mask / mm_token_type_ids [B, T],
-        #      pixel_values, image_grid_thw), "actions": tensor,
-        #      optional "state": tensor}. The HF processor already ran inside
+        # (A) pre-collated dict from QwenVLPreprocessCollate (this branch;
+        #     the branch above handles the same dict wrapped in
+        #     HostPinnedBatch): {"qwen_inputs": HF-processor output as pure
+        #     CPU tensors (input_ids / attention_mask / mm_token_type_ids
+        #     [B, T], pixel_values, image_grid_thw), "actions": tensor,
+        #     optional "state": tensor}. The HF processor already ran inside
         #     the DataLoader workers, so the main thread only does H2D copies
         #     + the VLM forward.
         # (B) legacy list-of-dicts (else branch): raw PIL images + str
         #     instructions; the HF processor runs HERE, on the training
         #     critical path, inside _encode_vl_hidden_states.
-        # Both branches meet the same contract for Step 4 below: vl_embs_list
+        # All branches meet the same contract for Step 4 below: vl_embs_list
         # (last N layer hidden states), backbone_attention_mask, and
         # actions/state as device tensors in base_hidden's dtype.
-        if isinstance(examples, dict) and "qwen_inputs" in examples:
+        elif isinstance(examples, dict) and "qwen_inputs" in examples:
             # Pre-collated path: only H2D copies + VLM forward on the main thread.
             device = self.qwen_vl_interface.model.device
             qwen_inputs = {
