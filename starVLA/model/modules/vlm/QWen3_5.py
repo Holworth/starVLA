@@ -81,6 +81,36 @@ class _QWen3_5_VL_Interface(nn.Module):
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
+        # [OPT #6; compile_mode also drives #9 max-autotune / #10 CUDA Graphs]
+        # Opt-in torch.compile of the hybrid text stack (the VLM forward is
+        # launch-bound in eager mode, ~4k kernel launches/step).
+        #
+        # IMPORTANT: compile each layer's bound `forward`, NOT the module and
+        # NOT the whole text model. transformers 5.3 collects
+        # output_hidden_states via forward hooks matched by
+        # `isinstance(module, Qwen3_5DecoderLayer)` (utils/output_capturing.py);
+        # wrapping layers in OptimizedModule breaks that isinstance match and
+        # silently truncates hidden_states (QwenPI needs all 32 layer states).
+        # Compiling the bound method keeps the module object and class
+        # identity, so the capture hooks still fire at the __call__ level,
+        # outside the compiled region. Pair with
+        # datasets.vla_data.collate_pad_to for static shapes.
+        if str(qwenvl_config.get("compile_language_model", False)).lower() in ("true", "1"):
+            compile_mode = qwenvl_config.get("compile_mode", None) or None
+            for layer in model.model.language_model.layers:
+                layer.forward = torch.compile(layer.forward, dynamic=False, mode=compile_mode)
+
+        # NOTE: compiling the vision tower blocks is NOT viable with the FA2
+        # ("mixed") vision path on this stack: the HF block computes
+        # max_seqlen as a GPU tensor and flash_attn's custom op requires a
+        # SymInt — dynamo fails hard (tried 2026-07-03, bench_M). Revisit
+        # after a transformers/flash-attn upgrade.
+        if str(qwenvl_config.get("compile_vision", False)).lower() in ("true", "1"):
+            raise NotImplementedError(
+                "compile_vision is incompatible with the FA2 vision path on "
+                "transformers 5.3 + flash-attn 2.7.4 (max_seqlen tensor vs SymInt); see QWen3_5.py note."
+            )
+
         self.model = model
         self.processor = processor
         self.config = config

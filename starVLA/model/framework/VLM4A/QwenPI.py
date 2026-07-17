@@ -351,6 +351,21 @@ class Qwen_PI(baseframework):
                 else None
             )
 
+        # [OPT #4] Optional right-padding of the encoder sequence to a fixed
+        # length so the DiT sees static shapes (required for torch.compile
+        # dynamic=False / CUDA Graphs to avoid per-length recompiles). Padded
+        # positions are masked out, so cross-attention results are unchanged.
+        pad_to = int(self.config.framework.action_model.get("pad_encoder_seq_to", 0) or 0)
+        cur_len = vl_embs_list[0].shape[1]
+        if pad_to and cur_len < pad_to:
+            pad_len = pad_to - cur_len
+            if backbone_attention_mask is None:
+                backbone_attention_mask = torch.ones(
+                    vl_embs_list[0].shape[0], cur_len, dtype=torch.bool, device=vl_embs_list[0].device
+                )
+            backbone_attention_mask = torch.nn.functional.pad(backbone_attention_mask, (0, pad_len), value=0)
+            vl_embs_list = [torch.nn.functional.pad(h, (0, 0, 0, pad_len)) for h in vl_embs_list]
+
         # Step 4: Action Expert Forward and Loss
         with torch.autocast("cuda", dtype=torch.float32):
             # Label alignment: take the last chunk_len segment
