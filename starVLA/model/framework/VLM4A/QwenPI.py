@@ -271,6 +271,11 @@ class Qwen_PI(baseframework):
             # Label alignment: take the last chunk_len segment
             actions_target = actions[:, -self.action_horizon :, :]  # (B, action_horizon, action_dim)
 
+            repeated_diffusion_steps = (
+                self.config.framework.action_model.get("repeated_diffusion_steps", 4)
+                if self.config and hasattr(self.config, "framework")
+                else 4
+            )
             repeated_diffusion_steps = 2  # NO repeat for big action FM
             actions_target_repeated = actions_target.repeat(repeated_diffusion_steps, 1, 1)
             # Repeat features for each layer
