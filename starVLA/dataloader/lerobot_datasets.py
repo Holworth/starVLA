@@ -234,26 +234,6 @@ def build_qwenvl_preprocess_collate(cfg):
         else None
     )
     keep_examples = str(vla_dataset_cfg.get("collate_keep_examples", False)).lower() in ("true", "1")
-    # [OPT #12 MRoPE precompute] Compute 3D MRoPE position ids in the
-    # workers and ship them with the batch (see QwenVLPreprocessCollate).
-    mrope_config = None
-    if str(vla_dataset_cfg.get("collate_mrope_posids", False)).lower() in ("true", "1"):
-        from transformers import AutoConfig
-
-        mrope_config = AutoConfig.from_pretrained(cfg.framework.qwenvl.base_vlm)
-        # The collate uses a Qwen3_5Model shim; other Qwen-VL variants
-        # have DIFFERENT mrope semantics (e.g. Qwen2.5-VL scales image
-        # temporal ids by tokens_per_second=4) and would train silently
-        # wrong. Refuse rather than inject mismatched position ids.
-        if getattr(mrope_config, "model_type", None) != "qwen3_5":
-            logger.warning(
-                "[dataloader] collate_mrope_posids disabled: base_vlm model_type "
-                f"'{getattr(mrope_config, 'model_type', None)}' != 'qwen3_5' "
-                "(the precompute shim implements Qwen3.5 mrope semantics only)"
-            )
-            mrope_config = None
-        else:
-            logger.info("[dataloader] collate_mrope_posids enabled: MRoPE position ids precomputed in workers")
     logger.info("[dataloader] preprocess_in_collate enabled: HF processor runs in DataLoader workers")
     return QwenVLPreprocessCollate(
         processor,
@@ -261,8 +241,36 @@ def build_qwenvl_preprocess_collate(cfg):
         pixel_dtype=pixel_dtype,
         keep_examples=keep_examples,
         pad_to=int(vla_dataset_cfg.get("collate_pad_to", 0) or 0),
-        mrope_config=mrope_config,
+        mrope_config=build_qwen35_mrope_config(cfg),
     )
+
+
+def build_qwen35_mrope_config(cfg):
+    """[OPT #12 MRoPE precompute] Factory for the config that drives the
+    worker-side MRoPE shim (see QwenVLPreprocessCollate._position_ids_for).
+
+    Returns the base VLM's AutoConfig when the feature is enabled AND the
+    model is Qwen3.5; returns None (feature off) otherwise. The model_type
+    gate is a correctness guard, not an optimization detail: other Qwen-VL
+    variants have DIFFERENT mrope temporal semantics (e.g. Qwen2.5-VL scales
+    image temporal ids by tokens_per_second=4) - injecting Qwen3.5-style ids
+    there would train silently wrong, so refuse instead.
+    """
+    vla_dataset_cfg = cfg.datasets.vla_data
+    if str(vla_dataset_cfg.get("collate_mrope_posids", False)).lower() not in ("true", "1"):
+        return None
+    from transformers import AutoConfig
+
+    mrope_config = AutoConfig.from_pretrained(cfg.framework.qwenvl.base_vlm)
+    if getattr(mrope_config, "model_type", None) != "qwen3_5":
+        logger.warning(
+            "[dataloader] collate_mrope_posids disabled: base_vlm model_type "
+            f"'{getattr(mrope_config, 'model_type', None)}' != 'qwen3_5' "
+            "(the precompute shim implements Qwen3.5 mrope semantics only)"
+        )
+        return None
+    logger.info("[dataloader] collate_mrope_posids enabled: MRoPE position ids precomputed in workers")
+    return mrope_config
 
 
 def make_LeRobotSingleDataset(
