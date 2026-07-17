@@ -28,6 +28,9 @@ STARVLA_SRC_IN="/code/$(basename "${STARVLA_SRC_HOST}")"
 GPUS="${GPUS:-8}"
 BS="${BS:-8}"
 GRAD_ACCUM="${GRAD_ACCUM:-1}"
+# DiT precision (framework.action_model.dit_dtype): bf16 = the measured config,
+# none = single-switch rollback to the caller's fp32 (pre-optimization behavior).
+DIT_DTYPE="${DIT_DTYPE:-bf16}"
 PROFILE_START_STEP="${PROFILE_START_STEP:-${START_STEP:-11}}"
 PROFILE_END_STEP="${PROFILE_END_STEP:-${END_STEP:-13}}"
 if (( PROFILE_END_STEP < PROFILE_START_STEP )); then
@@ -65,6 +68,7 @@ EOF
 {
   echo "run_id=${RUN_ID}"
   echo "gpus=${GPUS} per_gpu_batch=${BS} max_steps=${MAX_STEPS} grad_accum=${GRAD_ACCUM}"
+  echo "dit_dtype=${DIT_DTYPE}"
   echo "profile_window=${PROFILE_START_STEP}..${PROFILE_END_STEP}"
   echo "profile_ranks=${PROFILE_RANKS}"
   echo "out_dir=${OUT_DIR}"
@@ -128,6 +132,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --trainer.eval_interval 100000 \
       --trainer.save_interval 100000 \
       --trainer.logging_frequency 1 \
+      --framework.action_model.dit_dtype ${DIT_DTYPE} \
       --run_root_dir /tmp/ck \
       --run_id ${RUN_ID}; \
     status=\$?; \
