@@ -5,6 +5,12 @@
     "bf16": {
         "enabled": true
     },
+    "timers": {
+        "throughput": {
+            "enabled": true,
+            "synchronized": false
+        }
+    },
     "train_micro_batch_size_per_gpu": "auto",
     "train_batch_size": "auto",
     "gradient_accumulation_steps": 1,
