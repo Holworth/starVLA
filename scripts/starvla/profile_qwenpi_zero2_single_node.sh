@@ -141,6 +141,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --datasets.vla_data.num_workers 8 \
       --datasets.vla_data.collate_pad_to 192 \
       --framework.qwenvl.mrope_posid_cache ${MROPE_CACHE} \
+      --framework.qwenvl.attn_implementation mixed \
       --run_root_dir /tmp/ck \
       --run_id ${RUN_ID}; \
     status=\$?; \

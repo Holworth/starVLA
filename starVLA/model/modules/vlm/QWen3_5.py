@@ -57,9 +57,16 @@ class _QWen3_5_VL_Interface(nn.Module):
 
         qwenvl_config = config.framework.get("qwenvl", {})
         model_id = qwenvl_config.get("base_vlm", "Qwen/Qwen3.5-VL-4B-Instruct")
+        # [OPT #4] Honor the configured attn_implementation (a hard-coded
+        # "sdpa" here used to silently override the YAML's flash_attention_2).
         attn_implementation = qwenvl_config.get("attn_implementation", "sdpa")
+        # [OPT #5] "mixed" = FA2 for the vision tower (varlen kernel batches
+        # all images in one call per layer instead of one call per image) but
+        # SDPA for the text stack (FA2's unpad/repad overhead loses at
+        # seq~190).
+        if attn_implementation == "mixed":
+            attn_implementation = {"text_config": "sdpa", "vision_config": "flash_attention_2"}
 
-        attn_implementation = "sdpa"
         # Fallback to sdpa if flash_attention_2 is requested but flash_attn is not installed
         if attn_implementation == "flash_attention_2":
             if not has_flash_attn():
