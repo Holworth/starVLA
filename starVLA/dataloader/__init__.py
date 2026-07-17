@@ -45,10 +45,60 @@ def build_dataloader(cfg, dataset_py="lerobot_datasets_oxe"): # TODO now here on
             balance_trajectory_weights=vla_dataset_cfg.get("balance_trajectory_weights", False),
         )
 
+        # [OPT #3/#7, docs/qwenpi_zero2_h200_final_report.md] Opt-in fast
+        # collate: HF preprocessing in workers (+ HostPinnedBatch wrapping).
+        chosen_collate = collate_fn
+        if str(vla_dataset_cfg.get("preprocess_in_collate", False)).lower() in ("true", "1"):
+            from transformers import AutoProcessor
+            from starVLA.dataloader.lerobot_datasets import QwenVLPreprocessCollate
+            import torch as _torch
+
+            processor = AutoProcessor.from_pretrained(cfg.framework.qwenvl.base_vlm)
+            processor.tokenizer.padding_side = "left"
+            cot_prompt = (
+                vla_dataset_cfg.get("CoT_prompt", None) if "CoT_prompt" in vla_dataset_cfg else None
+            )
+            pixel_dtype = (
+                _torch.bfloat16
+                if str(vla_dataset_cfg.get("collate_pixels_bf16", True)).lower() in ("true", "1")
+                else None
+            )
+            keep_examples = str(vla_dataset_cfg.get("collate_keep_examples", False)).lower() in ("true", "1")
+            # [OPT #12 MRoPE precompute] Compute 3D MRoPE position ids in the
+            # workers and ship them with the batch (see QwenVLPreprocessCollate).
+            mrope_config = None
+            if str(vla_dataset_cfg.get("collate_mrope_posids", False)).lower() in ("true", "1"):
+                from transformers import AutoConfig
+
+                mrope_config = AutoConfig.from_pretrained(cfg.framework.qwenvl.base_vlm)
+                # The collate uses a Qwen3_5Model shim; other Qwen-VL variants
+                # have DIFFERENT mrope semantics (e.g. Qwen2.5-VL scales image
+                # temporal ids by tokens_per_second=4) and would train silently
+                # wrong. Refuse rather than inject mismatched position ids.
+                if getattr(mrope_config, "model_type", None) != "qwen3_5":
+                    logger.warning(
+                        "[dataloader] collate_mrope_posids disabled: base_vlm model_type "
+                        f"'{getattr(mrope_config, 'model_type', None)}' != 'qwen3_5' "
+                        "(the precompute shim implements Qwen3.5 mrope semantics only)"
+                    )
+                    mrope_config = None
+                else:
+                    logger.info("[dataloader] collate_mrope_posids enabled: MRoPE position ids precomputed in workers")
+            chosen_collate = QwenVLPreprocessCollate(
+                processor,
+                cot_prompt=cot_prompt,
+                pixel_dtype=pixel_dtype,
+                keep_examples=keep_examples,
+                pad_to=int(vla_dataset_cfg.get("collate_pad_to", 0) or 0),
+                host_batch=str(vla_dataset_cfg.get("collate_host_batch", False)).lower() in ("true", "1"),
+                mrope_config=mrope_config,
+            )
+            logger.info("[dataloader] preprocess_in_collate enabled: HF processor runs in DataLoader workers")
+
         num_workers = int(vla_dataset_cfg.get("num_workers", 4))
         dataloader_kwargs = {
             "batch_size": cfg.datasets.vla_data.per_device_batch_size,
-            "collate_fn": collate_fn,
+            "collate_fn": chosen_collate,
             "num_workers": num_workers,
             "pin_memory": bool(vla_dataset_cfg.get("pin_memory", True)),
             # shuffle=True

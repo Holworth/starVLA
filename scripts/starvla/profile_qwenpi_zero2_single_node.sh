@@ -133,6 +133,11 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --trainer.save_interval 100000 \
       --trainer.logging_frequency 1 \
       --framework.action_model.dit_dtype ${DIT_DTYPE} \
+      --datasets.vla_data.preprocess_in_collate true \
+      --datasets.vla_data.num_workers 8 \
+      --datasets.vla_data.collate_pad_to 192 \
+      --datasets.vla_data.collate_host_batch true \
+      --datasets.vla_data.collate_mrope_posids true \
       --run_root_dir /tmp/ck \
       --run_id ${RUN_ID}; \
     status=\$?; \
