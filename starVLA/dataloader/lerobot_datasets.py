@@ -112,6 +112,49 @@ class QwenVLPreprocessCollate:
             )
         return out
 
+
+def build_preprocess_collate(cfg, default=None):
+    """[OPT #3] Factory for the opt-in worker-side preprocessing collate.
+
+    Keeps model-family specifics OUT of the generic build_dataloader():
+    dispatches on the configured backbone and returns its preprocessing
+    collate, or ``default`` (the identity collate) when
+    ``datasets.vla_data.preprocess_in_collate`` is disabled or the backbone
+    has no preprocessing collate implemented. Currently implemented:
+    Qwen-VL family (frameworks carrying a ``qwenvl`` config section).
+    """
+    vla_dataset_cfg = cfg.datasets.vla_data
+    if str(vla_dataset_cfg.get("preprocess_in_collate", False)).lower() not in ("true", "1"):
+        return default
+    if "qwenvl" not in cfg.framework:
+        logger.warning(
+            "[dataloader] preprocess_in_collate=true but no preprocessing collate "
+            "is implemented for this backbone; falling back to the default collate"
+        )
+        return default
+
+    import torch
+    from transformers import AutoProcessor
+
+    processor = AutoProcessor.from_pretrained(cfg.framework.qwenvl.base_vlm)
+    processor.tokenizer.padding_side = "left"
+    cot_prompt = vla_dataset_cfg.get("CoT_prompt", None) if "CoT_prompt" in vla_dataset_cfg else None
+    pixel_dtype = (
+        torch.bfloat16
+        if str(vla_dataset_cfg.get("collate_pixels_bf16", True)).lower() in ("true", "1")
+        else None
+    )
+    keep_examples = str(vla_dataset_cfg.get("collate_keep_examples", False)).lower() in ("true", "1")
+    logger.info("[dataloader] preprocess_in_collate enabled: HF processor runs in DataLoader workers")
+    return QwenVLPreprocessCollate(
+        processor,
+        cot_prompt=cot_prompt,
+        pixel_dtype=pixel_dtype,
+        keep_examples=keep_examples,
+        pad_to=int(vla_dataset_cfg.get("collate_pad_to", 0) or 0),
+    )
+
+
 def make_LeRobotSingleDataset(
     data_root_dir: Path | str,
     data_name: str,
