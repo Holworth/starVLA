@@ -330,13 +330,21 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
         )
 
         # Layer-wise DiT forward. DiT handles cross/self-attention interleaving.
-        model_output = self.model(
-            hidden_states=sa_embs,
-            encoder_hidden_states=vl_embs_list,
-            timestep=t_discretized,
-            encoder_attention_mask=encoder_attention_mask,
-            return_pre_output=True,
-        )
+        # The caller wraps this whole forward() in a float32 autocast (needed for the
+        # noise/velocity arithmetic above and the loss below), but that also forces the
+        # DiT's internal Linear/Attention matmuls onto slow fp32 GEMM paths instead of
+        # bf16 tensor cores. Re-enable bf16 for just the transformer call: LayerNorm stays
+        # fp32 under autocast's own op whitelist, and TimestepEncoder.forward() explicitly
+        # casts to its own parameter dtype regardless of the ambient autocast, so this is
+        # safe and matches how the rest of the model (VLM backbone) already runs in bf16.
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            model_output = self.model(
+                hidden_states=sa_embs,
+                encoder_hidden_states=vl_embs_list,
+                timestep=t_discretized,
+                encoder_attention_mask=encoder_attention_mask,
+                return_pre_output=True,
+            )
 
         # Decode only the action-token positions.
         pred = self.action_decoder(model_output)
@@ -391,14 +399,16 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 else torch.cat((future_tokens, action_features), dim=1)
             )
 
-            # Layer-wise DiT forward. DiT handles cross/self-attention interleaving.
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs_list,
-                timestep=timesteps_tensor,
-                encoder_attention_mask=encoder_attention_mask,
-                return_pre_output=True,
-            )
+            # Layer-wise DiT forward. See forward() above for why this needs its own
+            # bf16 autocast rather than inheriting the caller's fp32 context.
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs_list,
+                    timestep=timesteps_tensor,
+                    encoder_attention_mask=encoder_attention_mask,
+                    return_pre_output=True,
+                )
             # Decode only the action-token positions.
             pred = self.action_decoder(model_output)
             pred_velocity = pred[:, -self.action_horizon :]
@@ -481,12 +491,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                 if state_features is not None
                 else torch.cat((future_tokens, action_features), dim=1)
             )
-            model_output = self.model(
-                hidden_states=sa_embs,
-                encoder_hidden_states=vl_embs_list,
-                timestep=timesteps,
-                return_pre_output=True,
-            )
+            # See forward() above for why this needs its own bf16 autocast rather than
+            # inheriting the caller's fp32 context.
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                model_output = self.model(
+                    hidden_states=sa_embs,
+                    encoder_hidden_states=vl_embs_list,
+                    timestep=timesteps,
+                    return_pre_output=True,
+                )
             pred = self.action_decoder(model_output)
             return pred[:, -self.action_horizon :]
 
@@ -607,12 +620,15 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
                     device=device,
                     dtype=torch.long,
                 )
-                model_output = self.model(
-                    hidden_states=sa_embs,
-                    encoder_hidden_states=vl_embs_list,
-                    timestep=temb_tensor,
-                    return_pre_output=True,
-                )
+                # See forward() above for why this needs its own bf16 autocast rather
+                # than inheriting the caller's fp32 context.
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    model_output = self.model(
+                        hidden_states=sa_embs,
+                        encoder_hidden_states=vl_embs_list,
+                        timestep=temb_tensor,
+                        return_pre_output=True,
+                    )
 
                 pred = self.action_decoder(model_output)
                 pred_velocity = pred[:, -self.action_horizon :]
