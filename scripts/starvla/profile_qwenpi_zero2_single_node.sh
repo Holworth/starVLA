@@ -136,6 +136,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --datasets.vla_data.preprocess_in_collate true \
       --datasets.vla_data.num_workers 8 \
       --datasets.vla_data.collate_pad_to 192 \
+      --datasets.vla_data.collate_mrope_posids true \
       --run_root_dir /tmp/ck \
       --run_id ${RUN_ID}; \
     status=\$?; \

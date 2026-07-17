@@ -183,6 +183,33 @@ class Qwen_PI(baseframework):
             vl_embs_list = list(qwenvl_outputs.hidden_states[-expected_layers:])
         return vl_embs_list, attention_mask
 
+    def _check_precomputed_position_ids(self, qwen_inputs):
+        """[OPT #12 MRoPE precompute] Debug guard (STARVLA_CHECK_POSIDS=1): recompute
+        the 3D MRoPE position ids with the stock HF path and assert the
+        collate-precomputed ones are identical. Costs the ~13 ms/step this
+        optimization removes, so only enable for validation runs."""
+        import os
+
+        if not os.environ.get("STARVLA_CHECK_POSIDS") or "position_ids" not in qwen_inputs:
+            return
+        ref = self.qwen_vl_interface.model.model.compute_3d_position_ids(
+            input_ids=qwen_inputs.get("input_ids"),
+            inputs_embeds=None,
+            image_grid_thw=qwen_inputs.get("image_grid_thw"),
+            attention_mask=qwen_inputs.get("attention_mask"),
+            mm_token_type_ids=qwen_inputs.get("mm_token_type_ids"),
+        )
+        # Explicit raise (not assert): must not be strippable by python -O,
+        # and the OK line below must never print without the comparison.
+        if ref is None or not torch.equal(ref, qwen_inputs["position_ids"]):
+            raise RuntimeError(
+                "precomputed MRoPE position_ids != HF compute_3d_position_ids "
+                f"(shapes {qwen_inputs['position_ids'].shape} vs {None if ref is None else ref.shape})"
+            )
+        if not getattr(self, "_posids_check_logged", False):
+            print("[QwenPI] STARVLA_CHECK_POSIDS: collate position_ids == HF compute OK", flush=True)
+            self._posids_check_logged = True
+
     def forward(
         self,
         examples=None,
@@ -225,6 +252,7 @@ class Qwen_PI(baseframework):
                 for k, v in examples["qwen_inputs"].items()
             }
             backbone_attention_mask = qwen_inputs.get("attention_mask", None)
+            self._check_precomputed_position_ids(qwen_inputs)
             # Same bf16 autocast the legacy path applies inside
             # _encode_vl_hidden_states: the VLM backbone loads and trains in
             # bf16 (DeepSpeed bf16 mode); only the execution site of the HF
