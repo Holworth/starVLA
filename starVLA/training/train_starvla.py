@@ -293,6 +293,10 @@ class VLATrainer(TrainerUtils):
         """Record training metrics."""
         rank = dist.get_rank() if dist.is_initialized() else 0
         if self.completed_steps % self.config.trainer.logging_frequency == 0 and rank == 0:
+            # [OPT #2] Materialize tensor metrics (the detached loss) only on
+            # logging steps — the counterpart of the .item() removal in
+            # _train_step.
+            metrics = {k: (v.item() if torch.is_tensor(v) else v) for k, v in metrics.items()}
             last_lrs = self.lr_scheduler.get_last_lr()
             for i, group in enumerate(self.optimizer.param_groups):
                 group_name = group.get("name", str(i))
@@ -423,8 +427,12 @@ class VLATrainer(TrainerUtils):
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
 
+        # [OPT #2, docs/qwenpi_zero2_h200_final_report.md] Keep the loss
+        # on-device; .item() forces a CPU-GPU sync every step, which
+        # serializes the step tail. _log_metrics materializes it only on
+        # logging steps.
         return {
-            "action_dit_loss": action_loss.item(),
+            "action_dit_loss": action_loss.detach(),
         }
 
     def _finalize_training(self):
