@@ -114,28 +114,34 @@ class QwenVLPreprocessCollate:
 
 
 def build_preprocess_collate(cfg, default=None):
-    """[OPT #3] Factory for the opt-in worker-side preprocessing collate.
+    """[OPT #3] Dispatch for the opt-in worker-side preprocessing collate.
 
-    Keeps model-family specifics OUT of the generic build_dataloader():
-    dispatches on the configured backbone and returns its preprocessing
-    collate, or ``default`` (the identity collate) when
-    ``datasets.vla_data.preprocess_in_collate`` is disabled or the backbone
-    has no preprocessing collate implemented. Currently implemented:
-    Qwen-VL family (frameworks carrying a ``qwenvl`` config section).
+    Pure dispatch, no model-family specifics: returns ``default`` (the
+    identity collate) when ``datasets.vla_data.preprocess_in_collate`` is
+    disabled or the configured backbone has no preprocessing collate
+    implemented; otherwise delegates to the per-family builder. Adding a
+    new backbone = one more dispatch arm here + its build_*_collate.
     """
     vla_dataset_cfg = cfg.datasets.vla_data
     if str(vla_dataset_cfg.get("preprocess_in_collate", False)).lower() not in ("true", "1"):
         return default
-    if "qwenvl" not in cfg.framework:
-        logger.warning(
-            "[dataloader] preprocess_in_collate=true but no preprocessing collate "
-            "is implemented for this backbone; falling back to the default collate"
-        )
-        return default
+    # Qwen-VL family: frameworks carrying a ``qwenvl`` config section.
+    if "qwenvl" in cfg.framework:
+        return build_qwenvl_preprocess_collate(cfg)
+    logger.warning(
+        "[dataloader] preprocess_in_collate=true but no preprocessing collate "
+        "is implemented for this backbone; falling back to the default collate"
+    )
+    return default
 
+
+def build_qwenvl_preprocess_collate(cfg):
+    """Construct the Qwen-VL worker-side preprocessing collate from config
+    (see QwenVLPreprocessCollate for what it does per batch)."""
     import torch
     from transformers import AutoProcessor
 
+    vla_dataset_cfg = cfg.datasets.vla_data
     processor = AutoProcessor.from_pretrained(cfg.framework.qwenvl.base_vlm)
     processor.tokenizer.padding_side = "left"
     cot_prompt = vla_dataset_cfg.get("CoT_prompt", None) if "CoT_prompt" in vla_dataset_cfg else None
