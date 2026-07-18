@@ -1,17 +1,16 @@
-# [OPT #14 fused text stack / #15 fused vision tower,
-#  docs/qwenpi_zero2_h200_optimization_log.md Round 9]
+# Fused text stack + fused vision tower.
 # Fused text-stack compile: put the forward-phase glue between the 32
 # per-layer CUDA graphs INTO the compiled region.
 #
-# REQUIRES the [OPT #13] torch 2.7.1 container stack (torch 2.7.1+cu126,
+# REQUIRES the torch 2.7.1 container stack (torch 2.7.1+cu126,
 # flash_attn 2.8.0.post2, causal-conv1d 1.5.2) AND, for STARVLA_FLA_TRACE=1,
 # the container-side fla edit: comment out @torch.compiler.disable at
-# fla/ops/gated_delta_rule/chunk.py:220 (a .bak is kept next to it). Neither
-# is part of the customer-pinned environment — see the optimization log for
-# the deviation list.
+# fla/ops/gated_delta_rule/chunk.py:220 (a .bak is kept next to it; both
+# handled by scripts/starvla/upgrade_container_torch27.sh). Neither is part
+# of the customer-pinned environment.
 #
-# Background (milestone2 gap analysis, docs/qwenpi_zero2_h200_final_report.md
-# section 3): with per-layer compiled forwards ([OPT #6]) the GPU still idles
+# Background (nsys gap analysis of the per-layer-compiled config): with
+# per-layer compiled forwards the GPU still idles
 # ~137 ms/step in <500us gaps, almost all of it host-side glue between the 32
 # layer graphs — transformers 5.3's output_hidden_states capture hooks
 # (utils/output_capturing.py fires a ContextVar-guarded hook at every layer
@@ -23,7 +22,7 @@
 #   - the 32-layer loop + hidden-state collection + final norm run inside ONE
 #     torch.compile(dynamic=False, mode=reduce-overhead) function, calling the
 #     UNBOUND Qwen3_5DecoderLayer.forward so neither the capture hooks nor any
-#     per-layer compiled bound method ([OPT #6]) is involved;
+#     per-layer compiled bound method is involved;
 #   - hidden_states output replicates capture_outputs' tie_last semantics
 #     exactly: (embeds, layer1..layer31, norm(layer32)) — what QwenPI slices
 #     with [-num_layers:].
@@ -92,7 +91,7 @@ if os.environ.get("STARVLA_FLA_TRACE"):
 
 
 def _group_runner(layers_group, mode):
-    layer_forward = _m.Qwen3_5DecoderLayer.forward  # unbound: no hooks, no [OPT #6] wrapper
+    layer_forward = _m.Qwen3_5DecoderLayer.forward  # unbound: no hooks, no per-layer compile wrapper
 
     def _run_group(hidden_states, cos, sin, causal_mask, linear_attn_mask, position_ids, cache_position):
         collected = []
@@ -124,7 +123,7 @@ def _make_fused_runner(self):
     # pool, and cudagraph_trees' allocator checkpointing collides with the
     # ZeRO-2 grad-hook NCCL allocations during backward
     # ("_cuda_setCheckpointPoolState: curr_block->next == nullptr", observed
-    # 2026-07-05). Per-layer compiles ([OPT #6]) dodge this because each layer
+    # 2026-07-05). Per-layer compiles dodge this because each layer
     # is its own top-level compile. Two supported shapes:
     #   STARVLA_FUSED_GROUP_SIZE=0 (default): whole stack in one compile,
     #     mode default (fusion, NO cudagraphs);
@@ -225,7 +224,7 @@ def _fused_forward(
         past_key_values=None,
         position_ids=text_position_ids,
     )
-    # [OPT #17] HF's _update_linear_attn_mask runs torch.all(attention_mask==1)
+    # HF's _update_linear_attn_mask runs torch.all(attention_mask==1)
     # in an `if` — a per-step GPU->CPU sync just to swap the mask for None as
     # an all-visible optimization. With left padding to collate_pad_to that
     # case never triggers, and passing the mask when it IS all-ones is still
@@ -255,7 +254,7 @@ print("[fused_text_stack_patch] applied", flush=True)
 
 
 # ---------------------------------------------------------------------------
-# [OPT #15] Fused VISION tower (STARVLA_FUSED_VISION=1): compile the 24 ViT
+# Fused VISION tower (STARVLA_FUSED_VISION=1): compile the 24 ViT
 # blocks (FA2 varlen) into one CUDA-graphed region. Historically blocked by
 # two dynamo breaks, both host-side constants (verified fullgraph fwd+bwd OK
 # on torch 2.7.1 + flash_attn 2.8.0.post2, 2026-07-06):
@@ -388,7 +387,7 @@ if os.environ.get("STARVLA_FUSED_VISION"):
 
 
 # ---------------------------------------------------------------------------
-# [OPT #17] Sync-free multimodal embedding merge (STARVLA_FAST_MM_MERGE=1).
+# Sync-free multimodal embedding merge (STARVLA_FAST_MM_MERGE=1).
 #
 # HF's Qwen3_5Model.get_placeholder_mask validates that the number of image
 # placeholder tokens matches the vision features via
@@ -397,7 +396,7 @@ if os.environ.get("STARVLA_FUSED_VISION"):
 # i.e. one more CPU<->GPU round trip per modality per step, sitting exactly
 # in the exposed gap between the vision graph and the first text-stack graph
 # (milestone4 step-40: ~150 tiny D2H syncs in 16 ms there, shared with the
-# in-model MRoPE compute that [OPT #12] removes).
+# in-model MRoPE compute that the MRoPE position-id cache removes).
 #
 # The fast path keeps the mask computation (pure GPU, async) and DROPS the
 # validation. Trade-off: a genuine token/feature count mismatch would surface

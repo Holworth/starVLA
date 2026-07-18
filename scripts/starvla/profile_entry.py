@@ -9,7 +9,7 @@ import starVLA.training.train_starvla as T
 import nvtx_patch  # noqa: F401  (导入即生效,必须在 T 之后)
 
 if os.environ.get("STARVLA_FUSED_TEXT_STACK"):
-    import fused_text_stack_patch  # noqa: F401  ([opt5] fused text-stack groups + fused vision tower + sync-free mm merge)
+    import fused_text_stack_patch  # noqa: F401  (fused text-stack groups + fused vision tower + sync-free mm merge)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_yaml", type=str, required=True)

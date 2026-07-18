@@ -242,9 +242,9 @@ class LayerwiseFlowmatchingActionHead(nn.Module):
 
         self.input_embedding_dim = diffusion_model_cfg_kwargs["input_embedding_dim"]
         self.model = DiT(**diffusion_model_cfg_kwargs)  # TODO: ideally copy LLM init from VLM
-        # [OPT #4, docs/qwenpi_zero2_h200_final_report.md; compile_mode also
-        # drives #9 max-autotune / #10 CUDA Graphs] Opt-in torch.compile of
-        # the DiT transformer (framework.action_model.compile_dit). The head
+        # Opt-in torch.compile of
+        # the DiT transformer (compile_mode selects the inductor mode, e.g.
+        # max-autotune or reduce-overhead = CUDA Graphs) (framework.action_model.compile_dit). The head
         # is launch-bound (~1000 fwd kernels for 32 blocks); shapes are static
         # once the encoder sequence is padded to a fixed length
         # (framework.action_model.pad_encoder_seq_to, handled by the framework).

@@ -81,8 +81,8 @@ class _QWen3_5_VL_Interface(nn.Module):
         processor = AutoProcessor.from_pretrained(model_id)
         processor.tokenizer.padding_side = "left"
 
-        # [OPT #6; compile_mode also drives #9 max-autotune / #10 CUDA Graphs]
-        # Opt-in torch.compile of the hybrid text stack (the VLM forward is
+        # Opt-in torch.compile of the hybrid text stack (compile_mode selects
+        # the inductor mode, e.g. max-autotune or reduce-overhead = CUDA Graphs) (the VLM forward is
         # launch-bound in eager mode, ~4k kernel launches/step).
         #
         # IMPORTANT: compile each layer's bound `forward`, NOT the module and

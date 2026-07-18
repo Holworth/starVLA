@@ -351,7 +351,7 @@ class Qwen_PI(baseframework):
                 else None
             )
 
-        # [OPT #4] Optional right-padding of the encoder sequence to a fixed
+        # Optional right-padding of the encoder sequence to a fixed
         # length so the DiT sees static shapes (required for torch.compile
         # dynamic=False / CUDA Graphs to avoid per-length recompiles). Padded
         # positions are masked out, so cross-attention results are unchanged.
