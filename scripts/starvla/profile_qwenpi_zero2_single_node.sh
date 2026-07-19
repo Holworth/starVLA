@@ -126,7 +126,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
     ${NSYS_BIN} --version && \
     set +e; \
     accelerate launch \
-      --config_file starVLA/config/deepseeds/deepspeed_zero2.yaml \
+      --config_file starVLA/config/deepseeds/deepspeed_zero2_qwenpi.yaml \
       --num_processes ${GPUS} \
       --no_python \
       /scripts/starvla/nsys_rank_wrapper.sh \

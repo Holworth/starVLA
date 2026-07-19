@@ -1,0 +1,21 @@
+# QwenPI-tuned variant of deepspeed_zero2.yaml. Identical except it points at
+# ds_config_qwenpi.yaml, whose single deviation from the shared ds_config.yaml
+# is reduce_bucket_size 5e8 -> 1.5e9.
+#
+# WHY THIS IS MODEL-SPECIFIC (do not reuse for other recipes): DeepSpeed
+# bucket sizes count gradient ELEMENTS, so the right value depends on the
+# model's parameter layout. QwenPI is 7.5B params full-unfreeze and its
+# 2.96B-param action-head DiT produces one contiguous ~3e9-element gradient
+# region; 1.5e9 lets that region fill exactly 2 reduce buckets (fewer, fuller
+# allreduces and a steadier step time). A different model would need its own
+# sizing - which is why the shared ds_config.yaml is left untouched and this
+# file carries the QwenPI name.
+compute_environment: LOCAL_MACHINE
+debug: false
+deepspeed_config:
+  deepspeed_config_file: "./starVLA/config/deepseeds/ds_config_qwenpi.yaml"
+  deepspeed_multinode_launcher: standard
+  zero3_init_flag: false
+distributed_type: DEEPSPEED
+num_machines: 1
+num_processes: 8
