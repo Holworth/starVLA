@@ -1,0 +1,7 @@
+{
+  "num_params": 7526000000,
+  "dtype": "bf16",
+  "recompute": false,
+  "tokens_per_step": null,
+  "_note": "num_params reverse-engineered from the milestone0 trace (FusedAdam multi_tensor_apply block count x chunk 65536 -> per-rank shard 9.407e8 elems x 8 ranks; cross-checked against fp32->bf16 partition-copy grids, agreement 0.02%). group0 qwen_vl_interface ~4.54e9, group1 action_model DiT ~2.99e9. tokens_per_step must be PER-RANK tokens per optimizer step (this is a single-rank trace and MFU uses single-GPU peak); fill it in and re-run: nsys_report.py analyze milestone0.rank0.sqlite --meta run_meta.json. recompute=false is an assumption - set true if activation checkpointing is enabled."
+}
