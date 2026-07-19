@@ -96,6 +96,12 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env HF_HOME=/model/huggingface --env HF_HUB_CACHE=/model/huggingface/hub \
   --env PYTHONPATH=/scripts/starvla \
   --env STARVLA_CHECK_POSIDS="${STARVLA_CHECK_POSIDS:-}" \
+  --env STARVLA_FUSED_TEXT_STACK=1 \
+  --env STARVLA_FLA_TRACE=1 \
+  --env STARVLA_FUSED_GROUP_SIZE=8 \
+  --env STARVLA_FUSED_COMPILE_MODE=reduce-overhead \
+  --env STARVLA_FUSED_VISION=1 \
+  --env STARVLA_FAST_MM_MERGE=1 \
   --env STARVLA_PROFILE_START_STEP="${PROFILE_START_STEP}" \
   --env STARVLA_PROFILE_END_STEP="${PROFILE_END_STEP}" \
   --env STARVLA_PROFILE_TRIGGER="${NSYS_CAPTURE_MODE}" \
@@ -142,6 +148,9 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --datasets.vla_data.collate_pad_to 192 \
       --framework.qwenvl.mrope_posid_cache ${MROPE_CACHE} \
       --framework.qwenvl.attn_implementation mixed \
+      --framework.action_model.compile_dit true \
+      --framework.action_model.compile_mode reduce-overhead \
+      --framework.action_model.pad_encoder_seq_to 192 \
       --run_root_dir /tmp/ck \
       --run_id ${RUN_ID}; \
     status=\$?; \
