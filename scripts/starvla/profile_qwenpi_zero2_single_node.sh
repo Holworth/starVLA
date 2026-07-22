@@ -96,6 +96,8 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env HF_HOME=/model/huggingface --env HF_HUB_CACHE=/model/huggingface/hub \
   --env PYTHONPATH=/scripts/starvla \
   --env STARVLA_CHECK_POSIDS="${STARVLA_CHECK_POSIDS:-}" \
+  --env STARVLA_EMIT_NVTX="${STARVLA_EMIT_NVTX:-}" \
+  --env STARVLA_NVTX_ACTION_HEAD="${STARVLA_NVTX_ACTION_HEAD:-}" \
   --env STARVLA_FUSED_TEXT_STACK=1 \
   --env STARVLA_FLA_TRACE=1 \
   --env STARVLA_FUSED_GROUP_SIZE=8 \
