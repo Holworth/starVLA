@@ -3,6 +3,18 @@
 > 与 `qwenpi-optimization.pptx` 的 speaker notes 同步;每页含讲稿与「客户可能的提问 → 建议答法」。
 > 弹药索引:所有 nsys trace 在 HF `qihankang/startVLA_profile`;DeepSpeed 机制源码行号在 P12 notes;否证清单在 P14 notes。
 
+## 全场定调(Thesis — 开场和收尾都可以点)
+
+**这是一个"开销主导"的负载,不是"计算主导"、更不是"注意力主导"的负载。** 一句话决定了我们所有优化方向:
+
+- **序列很短**:LLM 序列 192,DiT 序列 ~80(对比一般 LLM 训练的 2k–8k)。
+- **所以 O(seq²) 的 attention 几乎免费**:实测只占计算的 6%(理论 seq/hidden = 192/2560 ≈ 8%);主导算力的是 O(seq) 的**稠密线性层——投影 + FFN,占 47%**,而它们在这台机器上已经**饱和**(文本 M=1536 达 100% 功耗墙,DiT M=640 达 85%)。
+- **每步真正的有用计算就那么点**:GEMM busy 只有 95ms,而一步 306ms —— **31% 是计算,69% 是发射 / 同步 / 通信 / 空闲这些与序列长度无关的固定开销**。
+
+**推论(整个 deck 的逻辑主线)**:既然是开销主导,我们就**对症治开销**——CUDA Graph 治发射、免同步治 sync、ZeRO-2 调优治 comm;而**不去优化 attention**(它才 6%,连自己的开销都省不回来,这就是"全 FA2 更慢""FlashQLA 只有 10.5ms 天花板"这两个否证项的根因),也**不去写自定义 GEMM kernel**(已饱和)。唯一剩下的 kernel 级杠杆是 fp8(功耗墙),唯一的结构级杠杆是重叠 AllGather。
+
+**战略延伸(接 P13)**:随着客户加大序列(更多相机 / 更高分辨率 / 更长 horizon)或 batch,算术强度上升、固定开销被摊薄,负载会向 compute-bound 迁移——那时 fp8 接棒、发射/通信优化的相对收益下降。**我们的优化在客户当前这个小负载区间价值最高**;P13 的 MFU 18.8%→27.7% 已经在演示这个迁移。
+
 ## P1 封面
 
 **讲稿**:各位好。今天汇报我们在 starVLA QwenPI 训练上的性能优化工作:8 张 H200 上,把每步训练时间从 800 毫秒压到 306 毫秒。整个过程的方法论只有一句话——先用 nsys 找到问题,再针对问题做修复,每一步都有同机 A/B 数据。今天所有数字,大家都可以拿我们公开的 nsys trace 复核。
@@ -36,6 +48,7 @@
 - **Q: CPU 侧 forward 只有 225ms,为何画 309?** A: eager 下 CPU 发射超前:forward 函数 225ms 返回,GPU 队列里的 DiT 前向执行到 309。所以统一 GPU 时钟、kernel 按发射窗口归属(correlationId 可复算),两行边界才能对齐。
 - **Q: Qwen3.5 反向为何不是前向两倍?** A: GPU busy 恰是 2.46×(纯 GEMM 1.94×),符合理论;墙钟只有 1.18× 是前向发射饥饿——占空比 34% vs 70%。这是 P10 的主题。
 - **Q: 13,868 个 kernel 哪来的?** A: eager 逐算子发射,kernel 中位 8µs、79% 小于 20µs,发射成本成为主导。
+- **Q: 主要开销在 attention 吗?** A: 恰恰相反——序列短(192/80),O(seq²) 的 attention 只占计算 6%(实测 11ms,大头还是 vision);主导的是 O(seq) 的稠密线性层(投影+FFN,47%),且已饱和。所以这是"开销主导"负载:GEMM 只占一步的 31%,69% 是发射/同步/通信。**这决定了我们优化开销、不碰 attention、不写自定义 GEMM。**(详见开头"全场定调")
 
 ## P6 Optimization Roadmap
 
@@ -75,6 +88,7 @@
 **讲稿**:前向计算流上四条虚线,都是 GPU 等 CPU 的往返:①图像解码/tokenize 在 forward 里,每步开头 GPU 干等 ~37ms;②ViT 的 RoPE/位置编码逐步在 CPU 算;③ViT→decoder 的 MRoPE 位置索引也在 CPU;④loss 读回 + 计时器每步两次拉停发射流水线。时间线标出它们在真实步里的位置。
 
 - **Q: 这些是 HF 的 bug 吗?** A: 是通用性设计,不是 bug——但训练热循环输入形状固定,这些就成了纯开销,可预计算/缓存。
+- **Q: MRoPE 是干嘛的?为什么它是个同步点?** A: MRoPE 是 Qwen-VL 的多模态位置编码(arXiv:2409.12191):给序列每个 token 一个 3D 位置 (t,h,w)——文本三坐标一起走,视觉 token 的 h/w 编码该 patch 在图像 2D 网格里的行列,让 decoder 理解视觉 token 的空间结构(哪个 patch 在上/下/左/右)和视频时序。它只取决于序列结构(image_grid_thw + 图/文布局 + mask),**与像素内容无关**;但 HF 用 Python 循环算、含每图 .item() 读回(那 ~13ms 同步)。我们图像尺寸固定、pad-192 → 位置 id 每步一样 → 按 grid 缓存、只算一次(用 HF 自己的 compute_3d_position_ids,语义零风险,STARVLA_CHECK_POSIDS 逐位校验)。
 
 ## P9 Removing the Sync Points
 
