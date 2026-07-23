@@ -100,9 +100,12 @@
 
 ## P12 ZeRO-2 Comm Tuning: Two Knobs
 
-**讲稿**:两个旋钮两个问题。旋钮一 reduce_scatter=false:DS 默认每桶发送前 flatten 一次(诊断页那 22ms 的 CatArrayBatchedCopy),而梯度本就连续——纯冗余。旋钮二桶大小:DS 只有**两个**梯度缓冲,每次桶满计算流必须等上次 reduction 排空。真实对照:5e8 反向被打断 15 次/47ms;1.5e9 只有 8 次/27ms。两旋钮正交同向。
+**讲稿**:两个旋钮两个问题。旋钮一 reduce_scatter=false:这里有个反直觉的事实——DeepSpeed 默认的 reduce_scatter=true **底层其实仍是整桶 all_reduce**(不是真 reduce-scatter),只是多付了每桶的 flatten(诊断页那 22ms CatArrayBatchedCopy)和 copy-back;梯度本就连续,关掉后一次 all_reduce 直达,**字节完全不变、纯省两轮拷贝**(−13ms)。旋钮二桶大小:DS 只有**两个**梯度缓冲,每次桶满计算流必须等上次 reduction 排空。真实对照:5e8 反向被打断 15 次/47ms;1.5e9 只有 8 次/27ms。两旋钮正交同向。
 
-- **Q: AllReduce 字节 ×2,多节点成立吗?**(最尖锐)A: 直说:这是单节点 NVLink 结论——带宽有余且通信被重叠。跨节点 IB 权衡很可能反转,部署前需在你们集群重新 A/B,桶大小也按拓扑重调;都是 15 分钟级实验,可以一起跑。
+**reduce_scatter 的源码事实(应对追问)**:DeepSpeed 0.16.9 里 reduce_scatter=true(默认 use_multi_rank_bucket_allreduce=True,构造默认)→ allreduce_and_scatter → allreduce_bucket,其中 `rank=None` 时调 **dist.all_reduce(L1521)**——所以默认 true 路径是**完整 all_reduce**(两段全做,2(N−1)/N·G 字节)加重排,而非承诺的半量 reduce-scatter。真正的 reduce-scatter 只在 use_multi_rank=false 子路径(→ dist.reduce 逐分片),我们测过在单机更慢。
+
+- **Q(最尖锐): all_reduce 不就是 reduce-scatter + all-gather 吗?那 reduce_scatter=true 应该省一半字节?** A: 理论完全对——纯 reduce-scatter 跳过 all-gather 段、只搬一半字节,正是 ZeRO-2 该用的。但陷阱是 DeepSpeed 默认的 reduce_scatter=true 底层调的是 dist.all_reduce,**根本没做真 reduce-scatter**,搬满量字节还加重排,所以关掉它是纯赚、不是权衡。真 reduce-scatter 在另一条子路径,我们测过在单机反而更慢:NVLink 上通信与反向计算重叠、非带宽瓶颈(478 GB/s 已到顶但被藏住),砍一半字节几乎不缩短暴露时间,且它碎成很多小 dist.reduce 又照样 flatten。
+- **Q: 那多节点上呢?** A: 多节点通信暴露且带宽受限,砍一半字节才真正值钱——但正确做法是上一个**真正实现** reduce-scatter 的路径/新版 DS,不是把开关拨回默认 true(那只是 all_reduce+重排)。桶大小也要按拓扑重调;均为 15 分钟级实验,可以一起跑。
 - **Q: 1.5e9 通用吗?** A: 不通用——按梯度元素计数、取决于参数布局(DiT 那段 3e9 连续梯度),所以做成了模型级配置。
 - **Q: DS 为什么不修双缓冲?** A: 上游显存/流水深度取舍;我们的异步 gather 改造会动同一份代码,可一并评估。
 
