@@ -53,6 +53,19 @@
 - **保留 fp32 的全部部分**:①flow-matching 标量数学(噪声采样、(1−t)·noise+t·actions 插值、velocity 目标、timestep 采样与离散化);②action/state encoder、位置编码、action_decoder;③MSE loss;④DiT 内部 LayerNorm(autocast 白名单强制);⑤TimestepEncoder(显式 cast 到自身参数精度);⑥优化器——Adam 在 fp32 master 权重上更新,grad-norm 走 fp32 AllReduce。
 - **结果:训练 loss 没有可测的退化**。1000 步、仅 dtype 不同的对照:末段 100 步均值 0.1473 vs 0.1473(四位小数一致);末段逐步差 std 0.014,仅为单条曲线自身步间波动(0.080)的 0.4 倍——精度差异淹没在采样噪声之下。
 
+**混合精度训练的可行性(理论 + 实证)**:
+1. **数值理论**:bf16 与 fp32 指数位相同(8 bit)→ 动态范围一致,没有 fp16 的上/下溢与 loss-scaling 需求;尾数少(7 bit)的影响由三道防线兜住——tensor core 的 bf16 GEMM **以 fp32 累加**、优化器在 **fp32 master 权重**上更新(微小更新量不会被低精度舍入吞掉)、归约/归一化/loss 由 autocast 白名单强制 fp32。
+2. **业界实证**:千亿级模型的标准训练精度就是 bf16——BLOOM-176B 在 OPT 的 fp16 不稳定教训后明确选择 bf16;Llama 3 系列以 bf16 训练;Megatron/DeepSpeed 的官方配方即 bf16 计算 + fp32 master。开源 VLA 实现(如 OpenVLA)同样默认 bf16 autocast 微调。
+3. **本仓库实证**:同一次训练里 4.5B 的 VLM 主干从第一天起就在 bf16 下运行;动作头切 bf16 后的千步对照见上文统计。
+
+**参考文献**:
+- Micikevicius et al., *Mixed Precision Training*, ICLR 2018 (arXiv:1710.03740) — 混合精度训练奠基:低精度计算 + fp32 master 权重,训练质量与 fp32 持平。
+- Kalamkar et al., *A Study of BFLOAT16 for Deep Learning Training* (arXiv:1905.12322) — bf16 无需 loss scaling 即可匹配 fp32 收敛。
+- BigScience, *BLOOM* (arXiv:2211.05100) 与 Meta *OPT* (arXiv:2205.01068) 训练日志 — fp16 大模型不稳定的实录与 bf16 选型依据。
+- Meta, *The Llama 3 Herd of Models* (arXiv:2407.21783) — bf16 作为当代大模型的默认训练精度。
+- PyTorch AMP 官方文档(pytorch.org/docs/stable/amp.html)— autocast 嵌套语义与 fp32 白名单算子表;NVIDIA *Train With Mixed Precision* 指南(docs.nvidia.com)— tensor core fp32 累加;DeepSpeed bf16 配置文档。
+- Kim et al., *OpenVLA* (arXiv:2406.09246) — VLA 领域 bf16 微调的公开参照。
+
 - **Q: loss 一致 ≠ 任务成功率一致?** A: 同意——任务级评测要在你们的评测器上做,这是建议的联合验证项。我们的证据:千步损失轨迹统计不可区分 + 数值敏感处全部保留 fp32,与业界 VLA/diffusion 训练通行做法一致。
 - **Q: 为什么当初是 fp32?收窄合理吗?** A: 权重存储本就是 bf16,外层 fp32 从未保护过权重精度——基线花两倍 GEMM 代价买到的精度只作用于激活。收窄用的是 torch.autocast 的标准嵌套机制(内层覆盖外层、白名单算子仍走 fp32),与 VLM 主干的既有跑法一致,是 PyTorch AMP/Megatron/DeepSpeed 的标准配方。
 - **Q: 早期(前200步)两条曲线好像有偏差?** A: 扩散时间步/噪声未跨 run 固定种子,陡降段 loss 对抽到的 t 高度敏感;进入平稳段偏移严格归零(步401-600 与 901-1000 的均值差都是 0.0000)。需要逐位级验证可以加固定采样种子的模式。
