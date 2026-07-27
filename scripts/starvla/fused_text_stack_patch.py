@@ -489,6 +489,39 @@ def _patch_vision_tower():
 
     _m.Qwen3_5VisionModel.forward = _vm_forward
 
+    # split_sizes on the vision->text handoff are another grid-only constant:
+    # HF recomputes them every step as a GPU prod kernel + a .tolist() D2H
+    # sync (Qwen3_5Model.get_image_features), right where the merged image
+    # embeds hand over to the text stack. Cache the host list per grid key;
+    # first hit verifies against HF's own expression.
+    if _vit_input_cache_on:
+        _orig_gif = _m.Qwen3_5Model.get_image_features
+
+        def _gif_cached(self, pixel_values, image_grid_thw=None, **kwargs):
+            if image_grid_thw is None:
+                return _orig_gif(self, pixel_values, image_grid_thw=image_grid_thw, **kwargs)
+            kwargs.pop("return_dict", None)  # @can_return_tuple pops this on the original
+            cache = getattr(self, "_starvla_split_cache", None)
+            if cache is None:
+                cache = self._starvla_split_cache = {}
+            gcpu = image_grid_thw.cpu()
+            gkey = gcpu.numpy().tobytes()
+            split_sizes = cache.get(gkey)
+            if split_sizes is None:
+                m2 = self.visual.spatial_merge_size**2
+                split_sizes = (gcpu.prod(-1) // m2).tolist()
+                ref = (image_grid_thw.prod(-1) // m2).tolist()  # HF's expression, one-time
+                if split_sizes != ref:
+                    raise RuntimeError("[vit_input_cache] split_sizes mismatch vs HF expression")
+                cache[gkey] = split_sizes
+                print(f"[fused_text_stack_patch] split_sizes cache entry built ({len(split_sizes)} images)", flush=True)
+            pixel_values = pixel_values.type(self.visual.dtype)
+            vision_output = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
+            vision_output.pooler_output = torch.split(vision_output.pooler_output, split_sizes)
+            return vision_output
+
+        _m.Qwen3_5Model.get_image_features = _gif_cached
+
 
 if os.environ.get("STARVLA_FUSED_VISION"):
     _patch_vision_tower()
