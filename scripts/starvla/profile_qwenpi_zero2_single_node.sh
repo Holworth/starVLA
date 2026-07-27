@@ -52,6 +52,10 @@ NSYS_HOST_DIR="${NSYS_HOST_DIR:-${PROJ}/tools/nsight-systems/extract/opt/nvidia/
 NSYS_VERSION_DIR="${NSYS_VERSION_DIR:-2026.3.1}"
 NSYS_BIN="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64/nsys"
 NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,cublas,cudnn,osrt}"
+# Graph-level tracing intentionally hides kernels inside CUDA Graph replays.
+# Node-level tracing costs more, but is required for a reviewable kernel
+# timeline and avoids malformed whole-graph intervals in Nsight 2026.3.
+NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-node}"
 NSYS_CAPTURE_MODE="${NSYS_CAPTURE_MODE:-cuda}"
 NSYS_NVTX_CAPTURE="${NSYS_NVTX_CAPTURE:-profile_window}"
 NSYS_CAPTURE_RANGE_END="${NSYS_CAPTURE_RANGE_END:-stop}"
@@ -83,6 +87,7 @@ EOF
   echo "out_dir=${OUT_DIR}"
   echo "nsys=${NSYS_BIN}"
   echo "nsys_trace=${NSYS_TRACE}"
+  echo "nsys_cuda_graph_trace=${NSYS_CUDA_GRAPH_TRACE}"
   echo "nsys_capture_mode=${NSYS_CAPTURE_MODE} nvtx_capture=${NSYS_NVTX_CAPTURE}"
   echo "nsys_capture_range_end=${NSYS_CAPTURE_RANGE_END} kill=${NSYS_KILL}"
   echo "nsys_cuda_memory_usage=${NSYS_CUDA_MEMORY_USAGE}"
@@ -124,6 +129,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env STARVLA_NSYS_OUT_DIR="${OUT_DIR_IN}" \
   --env STARVLA_NSYS_BIN="${NSYS_BIN}" \
   --env STARVLA_NSYS_TRACE="${NSYS_TRACE}" \
+  --env STARVLA_NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE}" \
   --env STARVLA_NSYS_CAPTURE_MODE="${NSYS_CAPTURE_MODE}" \
   --env STARVLA_NSYS_NVTX_CAPTURE="${NSYS_NVTX_CAPTURE}" \
   --env STARVLA_NSYS_CAPTURE_RANGE_END="${NSYS_CAPTURE_RANGE_END}" \

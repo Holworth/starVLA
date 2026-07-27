@@ -8,6 +8,7 @@ run_id="${STARVLA_NSYS_RUN_ID:?STARVLA_NSYS_RUN_ID is required}"
 out_dir="${STARVLA_NSYS_OUT_DIR:?STARVLA_NSYS_OUT_DIR is required}"
 nsys_bin="${STARVLA_NSYS_BIN:-/opt/nvidia/nsight-systems/2026.3.1/target-linux-x64/nsys}"
 trace="${STARVLA_NSYS_TRACE:-cuda,nvtx,cublas,cudnn,osrt}"
+cuda_graph_trace="${STARVLA_NSYS_CUDA_GRAPH_TRACE:-node}"
 capture_mode="${STARVLA_NSYS_CAPTURE_MODE:-nvtx}"
 nvtx_capture="${STARVLA_NSYS_NVTX_CAPTURE:-profile_window}"
 capture_end="${STARVLA_NSYS_CAPTURE_RANGE_END:-stop}"
@@ -39,6 +40,7 @@ if [[ "${should_profile}" == "1" ]]; then
   nsys_args=(
     profile --force-overwrite=true
     --trace="${trace}"
+    --cuda-graph-trace="${cuda_graph_trace}"
     --sample=none --cpuctxsw=none
     --cuda-memory-usage="${cuda_memory_usage}"
     --export=sqlite
