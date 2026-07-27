@@ -119,6 +119,16 @@ if os.environ.get("STARVLA_NVTX_ACTION_HEAD"):
         LayerwiseFlowmatchingActionHead as _LFM,
     )
     from starVLA.model.modules.action_model.flow_matching_head.cross_attention_dit import DiT as _DiT
+    from starVLA.model.modules.vlm.QWen3_5 import _QWen3_5_VL_Interface as _QVL
+
+    _orig_qvl_fwd = _QVL.forward
+    def _qvl_forward(self, *a, **k):
+        torch.cuda.nvtx.range_push("qwenvl_fwd")
+        try:
+            return _orig_qvl_fwd(self, *a, **k)
+        finally:
+            torch.cuda.nvtx.range_pop()
+    _QVL.forward = _qvl_forward
 
     _orig_lfm_fwd = _LFM.forward
     def _lfm_forward(self, *a, **k):

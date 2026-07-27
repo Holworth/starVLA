@@ -197,27 +197,83 @@ class Qwen_PI(baseframework):
         inner = getattr(getattr(self.qwen_vl_interface, "model", None), "model", None)
         if inner is None or not hasattr(inner, "compute_3d_position_ids"):
             return
+        mm_cpu = mm_tt.cpu().numpy()
+        mask_cpu = mask.cpu().numpy() if mask is not None else None
+        grid_cpu = grid.cpu().numpy()
         key = (
-            mm_tt.cpu().numpy().tobytes(),
-            mask.cpu().numpy().tobytes() if mask is not None else b"",
-            grid.cpu().numpy().tobytes(),
+            mm_cpu.tobytes(),
+            mask_cpu.tobytes() if mask_cpu is not None else b"",
+            grid_cpu.tobytes(),
         )
         pos = self._mrope_posid_cache.get(key)
         if pos is None:
-            # Cache miss (first step / new shape combination): pay HF's stock
-            # python-loop compute once, keep the resulting GPU tensor.
-            pos = inner.compute_3d_position_ids(
-                input_ids=input_ids,
-                inputs_embeds=None,
-                image_grid_thw=grid,
-                attention_mask=mask,
-                mm_token_type_ids=mm_tt,
+            # Batch-key miss. At small bs the batch key repeats and this is
+            # rare; at bs>=24 the key is a new combination of per-sample
+            # instruction lengths nearly every step, so the batch cache
+            # silently degrades to per-step misses (HF's stock per-sample
+            # loop: ~60 ms/step at bs32, 579 D2H readbacks + ~1.5k tiny
+            # kernels). position ids are computed independently per sample
+            # inside HF's loop, so cache at SAMPLE granularity (per-sample
+            # keys DO repeat: one instruction x a fixed image layout) and
+            # assemble the batch with a single cat.
+            pos = self._assemble_posids_per_sample(
+                inner, input_ids, mm_tt, mask, grid, mm_cpu, mask_cpu, grid_cpu
             )
+            if pos is None:
+                # Non-uniform images/sample or sample compute declined:
+                # stock full-batch fallback (original PR#10 behavior).
+                pos = inner.compute_3d_position_ids(
+                    input_ids=input_ids,
+                    inputs_embeds=None,
+                    image_grid_thw=grid,
+                    attention_mask=mask,
+                    mm_token_type_ids=mm_tt,
+                )
             if pos is None:
                 return
             if len(self._mrope_posid_cache) < 64:
                 self._mrope_posid_cache[key] = pos
         qwen_inputs["position_ids"] = pos
+
+    def _assemble_posids_per_sample(
+        self, inner, input_ids, mm_tt, mask, grid, mm_cpu, mask_cpu, grid_cpu
+    ):
+        """[OPT mrope-cache] Sample-granularity position-id cache. Requires a
+        uniform images-per-sample layout to map grid rows to samples (true
+        for this workload; returns None otherwise so the caller falls back).
+        Per-sample results come from the model's OWN compute_3d_position_ids
+        on 1-sample slices, so semantics match HF exactly; the batch is
+        rebuilt with one cat along dim=1 ([3, B, S])."""
+        B = input_ids.shape[0]
+        n_img = grid.shape[0]
+        if B == 0 or n_img % B != 0:
+            return None
+        ipp = n_img // B
+        cache = getattr(self, "_mrope_sample_cache", None)
+        if cache is None:
+            cache = self._mrope_sample_cache = {}
+        parts = []
+        for i in range(B):
+            skey = (
+                mm_cpu[i].tobytes(),
+                mask_cpu[i].tobytes() if mask_cpu is not None else b"",
+                grid_cpu[i * ipp : (i + 1) * ipp].tobytes(),
+            )
+            p = cache.get(skey)
+            if p is None:
+                p = inner.compute_3d_position_ids(
+                    input_ids=input_ids[i : i + 1],
+                    inputs_embeds=None,
+                    image_grid_thw=grid[i * ipp : (i + 1) * ipp],
+                    attention_mask=mask[i : i + 1] if mask is not None else None,
+                    mm_token_type_ids=mm_tt[i : i + 1],
+                )
+                if p is None:
+                    return None
+                if len(cache) < 4096:
+                    cache[skey] = p
+            parts.append(p)
+        return torch.cat(parts, dim=1)
 
     def _check_precomputed_position_ids(self, qwen_inputs):
         """[OPT mrope-cache] Debug guard (STARVLA_CHECK_POSIDS=1): recompute

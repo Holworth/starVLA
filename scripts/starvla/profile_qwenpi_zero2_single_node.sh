@@ -105,6 +105,7 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env STARVLA_FUSED_VISION=1 \
   --env STARVLA_FAST_MM_MERGE=1 \
   --env STARVLA_INDEX_MM_MERGE=1 \
+  --env STARVLA_VIT_INPUT_CACHE="${STARVLA_VIT_INPUT_CACHE:-1}" \
   --env STARVLA_PROFILE_START_STEP="${PROFILE_START_STEP}" \
   --env STARVLA_PROFILE_END_STEP="${PROFILE_END_STEP}" \
   --env STARVLA_PROFILE_TRIGGER="${NSYS_CAPTURE_MODE}" \
@@ -147,7 +148,8 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
       --trainer.logging_frequency 1 \
       --framework.action_model.dit_dtype ${DIT_DTYPE} \
       --datasets.vla_data.preprocess_in_collate true \
-      --datasets.vla_data.num_workers 8 \
+      --datasets.vla_data.num_workers ${NUM_WORKERS:-8} \
+      ${VIDEO_BACKEND:+--datasets.vla_data.video_backend ${VIDEO_BACKEND}} \
       --datasets.vla_data.collate_pad_to 192 \
       --framework.qwenvl.mrope_posid_cache ${MROPE_CACHE} \
       --framework.qwenvl.attn_implementation mixed \

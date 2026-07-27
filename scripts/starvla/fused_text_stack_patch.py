@@ -324,35 +324,144 @@ def _patch_vision_tower():
 
     _orig_vm_forward = _m.Qwen3_5VisionModel.forward
 
-    def _vm_forward(self, hidden_states, grid_thw, **kwargs):
-        if kwargs.get("output_hidden_states") or kwargs.get("output_attentions"):
-            return _orig_vm_forward(self, hidden_states, grid_thw, **kwargs)
-        # preamble identical to HF (patch embed + pos embeds are weight-
-        # dependent, must recompute every step)
-        hidden_states = self.patch_embed(hidden_states)
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
-        cos, sin = emb.cos(), emb.sin()
+    # ViT input-structure cache (STARVLA_VIT_INPUT_CACHE=1). Everything the
+    # HF vision preamble derives from grid_thw alone is grid-constant across
+    # steps in this workload (static resize -> identical grid_thw bytes every
+    # batch): the rotary cos/sin tables, cu_seqlens, max_seqlen, and — the
+    # expensive one — the pos-embed interpolation STRUCTURE. HF's
+    # fast_pos_embed_interpolate rebuilds python lists per image per step
+    # (grid.tolist() D2H sync + 4x len-16k list extends + torch.tensor H2D);
+    # at bs32 the whole preamble is ~90 ms of exposed CPU (716 memcpys, 587
+    # stream syncs). Only the gather from the TRAINABLE self.pos_embed.weight
+    # must run every step, so we cache (idx, weight, perm) and reduce the
+    # per-step work to gather * weight -> sum -> index_select, which keeps
+    # the autograd path to pos_embed.weight intact. The first hit per grid
+    # key verifies the cached-path output against HF's original computation.
+    _vit_input_cache_on = bool(os.environ.get("STARVLA_VIT_INPUT_CACHE"))
+
+    def _build_vit_input_entry(self, grid_thw, gcpu):
+        device = self.pos_embed.weight.device
+        wdtype = self.pos_embed.weight.dtype
+        merge_size = self.config.spatial_merge_size
+        grid_list = gcpu.tolist()
+
+        # --- pos-embed interpolation structure (mirrors HF fast_pos_embed_interpolate)
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+        for t, h, w in grid_list:
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+            h_floor, w_floor = h_idxs.int(), w_idxs.int()
+            h_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            w_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            dh, dw = h_idxs - h_floor, w_idxs - w_floor
+            base_h = h_floor * self.num_grid_per_side
+            base_h_ceil = h_ceil * self.num_grid_per_side
+            indices = [
+                (base_h[None].T + w_floor[None]).flatten(),
+                (base_h[None].T + w_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_ceil[None]).flatten(),
+            ]
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=device)
+        weight_tensor = torch.tensor(weight_list, dtype=wdtype, device=device)
+
+        # --- row permutation replicating HF's split -> repeat(t) -> view/permute/flatten
+        tokens_per_img = [h * w for _, h, w in grid_list]
+        parts = torch.arange(sum(tokens_per_img)).split(tokens_per_img)
+        perm_parts = []
+        for part, (t, h, w) in zip(parts, grid_list):
+            p = part.repeat(t)
+            p = (
+                p.view(t, h // merge_size, merge_size, w // merge_size, merge_size)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(-1)
+            )
+            perm_parts.append(p)
+        perm = torch.cat(perm_parts).to(device)
+
+        # --- grid-constant rotary tables and cu_seqlens (HF expressions verbatim)
+        with torch.no_grad():
+            rotary = self.rot_pos_emb(grid_thw)
+            seq_len = rotary.shape[0]
+            rotary = rotary.reshape(seq_len, -1)
+            emb = torch.cat((rotary, rotary), dim=-1)
+            cos, sin = emb.cos(), emb.sin()
         cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
             dim=0, dtype=torch.int32
         )
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        ms = int((gcpu[:, 1] * gcpu[:, 2]).repeat_interleave(gcpu[:, 0]).max())
 
-        # per-grid constant max_seqlen (host int, cached; the tiny D2H here
-        # replaces the .item() the eager flash path already paid every step)
-        if not hasattr(self, "_starvla_ms_cache"):
-            self._starvla_ms_cache = {}
+        entry = {
+            "idx": idx_tensor, "w": weight_tensor, "perm": perm,
+            "cos": cos, "sin": sin, "cu": cu_seqlens, "ms": ms,
+        }
+        # one-time equivalence check of the cached pos-embed path vs HF
+        # (4-term add in HF's order -> bitwise-identical, not just allclose)
+        with torch.no_grad():
+            ref = self.fast_pos_embed_interpolate(grid_thw).float()
+            pe = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+            got = (pe[0] + pe[1] + pe[2] + pe[3]).index_select(0, perm).float()
+            err = (ref - got).abs().max().item()
+            if err > 2e-3:
+                raise RuntimeError(f"[vit_input_cache] pos-embed mismatch: max|diff|={err}")
+            print(f"[fused_text_stack_patch] vit input cache entry built (seq {seq_len}, max|diff|={err:.2e})", flush=True)
+        return entry
+
+    def _vm_forward(self, hidden_states, grid_thw, **kwargs):
+        if kwargs.get("output_hidden_states") or kwargs.get("output_attentions"):
+            return _orig_vm_forward(self, hidden_states, grid_thw, **kwargs)
+        hidden_states = self.patch_embed(hidden_states)
+
         gcpu = grid_thw.cpu()
         gkey = gcpu.numpy().tobytes()
-        ms = self._starvla_ms_cache.get(gkey)
-        if ms is None:
-            ms = int((gcpu[:, 1] * gcpu[:, 2]).repeat_interleave(gcpu[:, 0]).max())
-            self._starvla_ms_cache[gkey] = ms
+        if _vit_input_cache_on:
+            cache = getattr(self, "_starvla_vit_in_cache", None)
+            if cache is None:
+                cache = self._starvla_vit_in_cache = {}
+            entry = cache.get(gkey)
+            if entry is None:
+                entry = cache[gkey] = _build_vit_input_entry(self, grid_thw, gcpu)
+            # per-step: only the gather from the trainable pos_embed.weight
+            # (4-term add matches HF's summation order bit-for-bit)
+            pe = self.pos_embed(entry["idx"]) * entry["w"][:, :, None]
+            pos_embeds = (pe[0] + pe[1] + pe[2] + pe[3]).index_select(0, entry["perm"])
+            hidden_states = hidden_states + pos_embeds
+            seq_len, _ = hidden_states.size()
+            hidden_states = hidden_states.reshape(seq_len, -1)
+            cos, sin, cu_seqlens, ms = entry["cos"], entry["sin"], entry["cu"], entry["ms"]
+        else:
+            # original per-step preamble (pos embeds + rotary + cu_seqlens)
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+            hidden_states = hidden_states + pos_embeds
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+            seq_len, _ = hidden_states.size()
+            hidden_states = hidden_states.reshape(seq_len, -1)
+            rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            cos, sin = emb.cos(), emb.sin()
+            cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+                dim=0, dtype=torch.int32
+            )
+            cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+            # per-grid constant max_seqlen (host int, cached; the tiny D2H here
+            # replaces the .item() the eager flash path already paid every step)
+            if not hasattr(self, "_starvla_ms_cache"):
+                self._starvla_ms_cache = {}
+            ms = self._starvla_ms_cache.get(gkey)
+            if ms is None:
+                ms = int((gcpu[:, 1] * gcpu[:, 2]).repeat_interleave(gcpu[:, 0]).max())
+                self._starvla_ms_cache[gkey] = ms
         for blk in self.blocks:
             blk.attn._starvla_max_seqlen = ms
 
@@ -379,6 +488,39 @@ def _patch_vision_tower():
         )
 
     _m.Qwen3_5VisionModel.forward = _vm_forward
+
+    # split_sizes on the vision->text handoff are another grid-only constant:
+    # HF recomputes them every step as a GPU prod kernel + a .tolist() D2H
+    # sync (Qwen3_5Model.get_image_features), right where the merged image
+    # embeds hand over to the text stack. Cache the host list per grid key;
+    # first hit verifies against HF's own expression.
+    if _vit_input_cache_on:
+        _orig_gif = _m.Qwen3_5Model.get_image_features
+
+        def _gif_cached(self, pixel_values, image_grid_thw=None, **kwargs):
+            if image_grid_thw is None:
+                return _orig_gif(self, pixel_values, image_grid_thw=image_grid_thw, **kwargs)
+            kwargs.pop("return_dict", None)  # @can_return_tuple pops this on the original
+            cache = getattr(self, "_starvla_split_cache", None)
+            if cache is None:
+                cache = self._starvla_split_cache = {}
+            gcpu = image_grid_thw.cpu()
+            gkey = gcpu.numpy().tobytes()
+            split_sizes = cache.get(gkey)
+            if split_sizes is None:
+                m2 = self.visual.spatial_merge_size**2
+                split_sizes = (gcpu.prod(-1) // m2).tolist()
+                ref = (image_grid_thw.prod(-1) // m2).tolist()  # HF's expression, one-time
+                if split_sizes != ref:
+                    raise RuntimeError("[vit_input_cache] split_sizes mismatch vs HF expression")
+                cache[gkey] = split_sizes
+                print(f"[fused_text_stack_patch] split_sizes cache entry built ({len(split_sizes)} images)", flush=True)
+            pixel_values = pixel_values.type(self.visual.dtype)
+            vision_output = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True, **kwargs)
+            vision_output.pooler_output = torch.split(vision_output.pooler_output, split_sizes)
+            return vision_output
+
+        _m.Qwen3_5Model.get_image_features = _gif_cached
 
 
 if os.environ.get("STARVLA_FUSED_VISION"):
