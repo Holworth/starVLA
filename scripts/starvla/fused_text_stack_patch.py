@@ -90,6 +90,69 @@ if os.environ.get("STARVLA_FLA_TRACE"):
     print("[fused_text_stack_patch] fla device checks constant-folded (STARVLA_FLA_TRACE)", flush=True)
 
 
+# ---------------------------------------------------------------------------
+# Fast causal-conv as a FUNCTIONAL custom op. The DaoAILab package (1.5.2)
+# ships opaque custom ops, but with out=-mutation signatures: under
+# torch.compile their auto-functionalization re-records/recompiles every step
+# (measured 146-148 s/step at bs32 with reduce-overhead group runners). A pure
+# functional wrapper around the same CUDA kernels stays a single opaque node:
+# normal compile time, fast kernels inside the graph.
+try:
+    from causal_conv1d.cpp_functions import (
+        causal_conv1d_fwd_function as _cc_fwd_fn,
+        causal_conv1d_bwd_function as _cc_bwd_fn,
+    )
+except Exception:
+    _cc_fwd_fn = None
+
+if _cc_fwd_fn is not None:
+    from typing import Optional as _Opt
+
+    @torch.library.custom_op("starvla::causal_conv1d_silu", mutates_args=())
+    def _starvla_causal_conv1d_silu(
+        x: torch.Tensor, weight: torch.Tensor, bias: _Opt[torch.Tensor]
+    ) -> torch.Tensor:
+        # mirror CausalConv1dFn.forward's layout handling
+        if x.stride(2) != 1 and x.stride(1) != 1:
+            x = x.contiguous()
+        b = bias.contiguous() if bias is not None else None
+        return _cc_fwd_fn(x, weight, b, None, None, None, True)
+
+    @_starvla_causal_conv1d_silu.register_fake
+    def _starvla_causal_conv1d_silu_fake(x, weight, bias):
+        return torch.empty_like(x)
+
+    def _starvla_cc_setup(ctx, inputs, output):
+        x, weight, bias = inputs
+        ctx.has_bias = bias is not None
+        ctx.save_for_backward(x, weight, bias if bias is not None else torch.empty(0, device=x.device))
+
+    def _starvla_cc_backward(ctx, dout):
+        x, weight, bias = ctx.saved_tensors
+        if not ctx.has_bias:
+            bias = None
+        if x.stride(2) != 1 and x.stride(1) != 1:
+            x = x.contiguous()
+        if dout.stride(2) != 1 and dout.stride(1) != 1:
+            dout = dout.contiguous()
+        dx, dweight, dbias, _ = _cc_bwd_fn(x, weight, bias, dout, None, None, None, None, False, True)
+        return dx, dweight, dbias if ctx.has_bias else None
+
+    torch.library.register_autograd(
+        "starvla::causal_conv1d_silu", _starvla_cc_backward, setup_context=_starvla_cc_setup
+    )
+
+    def _starvla_fast_conv_shim(x, weight, bias=None, activation=None, seq_idx=None, **kwargs):
+        # transformers' GatedDeltaNet training path uses activation="silu",
+        # seq_idx=None; anything else takes the stock package path (eager).
+        if seq_idx is not None or activation not in ("silu", "swish"):
+            from causal_conv1d import causal_conv1d_fn as _pkg_fn
+            return _pkg_fn(x=x, weight=weight, bias=bias, activation=activation, seq_idx=seq_idx, **kwargs)
+        return torch.ops.starvla.causal_conv1d_silu(x, weight, bias)
+else:
+    _starvla_fast_conv_shim = None
+
+
 def _group_runner(layers_group, mode):
     layer_forward = _m.Qwen3_5DecoderLayer.forward  # unbound: no hooks, no per-layer compile wrapper
 
@@ -130,14 +193,27 @@ def _make_fused_runner(self):
     #   STARVLA_FUSED_GROUP_SIZE=N: ceil(32/N) independent top-level compiles
     #     (safe with reduce-overhead, like per-layer, but N x less glue).
     layers = tuple(self.layers[: self.config.num_hidden_layers])
-    if os.environ.get("STARVLA_FLA_TRACE"):
-        # causal_conv1d 1.5.2 registers custom ops but calls them with a
-        # non-contiguous out= tensor, which dynamo rejects. Force the HF
-        # torch-native fallback (F.silu(self.conv1d(x))) — numerically the
-        # same op — so inductor owns the conv inside the graph.
+    if os.environ.get("STARVLA_CONV_TORCH_FALLBACK") or _starvla_fast_conv_shim is None:
+        # Rollback path (formerly the default, keyed off STARVLA_FLA_TRACE):
+        # force the HF torch-native conv (F.silu(self.conv1d(x))) inside the
+        # graph — numerically the same op, but inductor lowers it to
+        # conv_depthwise2d at ~8.5x the kernel time (measured 29 ms/step at
+        # bs24 vs ~4 ms for the CUDA kernels, fwd+bwd). Kept as an opt-out
+        # because it is the only conv path with zero custom-op dependencies.
         for layer in layers:
             if getattr(layer, "layer_type", None) == "linear_attention":
                 layer.linear_attn.causal_conv1d_fn = None
+        print("[fused_text_stack_patch] conv: torch-native fallback (STARVLA_CONV_TORCH_FALLBACK)", flush=True)
+    else:
+        # Default: route the DeltaNet short conv through our functional
+        # custom op (see registration above) — fast CUDA kernels inside the
+        # compiled graph, single opaque node, no per-step recompiles. The
+        # stock package fn must NOT be left in place under compile: its
+        # out=-mutation ops trigger per-step re-functionalization.
+        for layer in layers:
+            if getattr(layer, "layer_type", None) == "linear_attention":
+                layer.linear_attn.causal_conv1d_fn = _starvla_fast_conv_shim
+        print("[fused_text_stack_patch] conv: starvla::causal_conv1d_silu custom op", flush=True)
     group_size = int(os.environ.get("STARVLA_FUSED_GROUP_SIZE", "0") or 0)
     mode = os.environ.get(
         "STARVLA_FUSED_COMPILE_MODE", "reduce-overhead" if group_size else "default"
