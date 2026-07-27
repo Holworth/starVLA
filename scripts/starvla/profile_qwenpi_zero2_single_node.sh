@@ -34,6 +34,10 @@ DIT_DTYPE="${DIT_DTYPE:-bf16}"
 # MRoPE position-id cache (framework.qwenvl.mrope_posid_cache): true = the
 # measured config, MROPE_CACHE=false rolls back to HF per-step compute.
 MROPE_CACHE="${MROPE_CACHE:-true}"
+# Structured worker-layout + bounded per-rank GPU metadata caches. This one
+# switch rolls back MRoPE/ViT/split/index/causal-mask metadata consumers to
+# their stock HF paths for paired correctness runs.
+METADATA_CACHE="${METADATA_CACHE:-1}"
 PROFILE_START_STEP="${PROFILE_START_STEP:-${START_STEP:-11}}"
 PROFILE_END_STEP="${PROFILE_END_STEP:-${END_STEP:-13}}"
 if (( PROFILE_END_STEP < PROFILE_START_STEP )); then
@@ -72,6 +76,8 @@ EOF
   echo "run_id=${RUN_ID}"
   echo "gpus=${GPUS} per_gpu_batch=${BS} max_steps=${MAX_STEPS} grad_accum=${GRAD_ACCUM}"
   echo "dit_dtype=${DIT_DTYPE}"
+  echo "metadata_cache=${METADATA_CACHE} mrope_cache=${MROPE_CACHE}"
+  echo "profile_prebuild_seed=${STARVLA_PROFILE_PREBUILD_SEED:-}"
   echo "profile_window=${PROFILE_START_STEP}..${PROFILE_END_STEP}"
   echo "profile_ranks=${PROFILE_RANKS}"
   echo "out_dir=${OUT_DIR}"
@@ -95,6 +101,9 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env WANDB_MODE=disabled --env PYTHONWARNINGS=ignore \
   --env HF_HOME=/model/huggingface --env HF_HUB_CACHE=/model/huggingface/hub \
   --env PYTHONPATH=/scripts/starvla \
+  --env STARVLA_METADATA_CACHE="${METADATA_CACHE}" \
+  --env STARVLA_CHECK_METADATA_CACHE="${STARVLA_CHECK_METADATA_CACHE:-}" \
+  --env STARVLA_PROFILE_PREBUILD_SEED="${STARVLA_PROFILE_PREBUILD_SEED:-}" \
   --env STARVLA_CHECK_POSIDS="${STARVLA_CHECK_POSIDS:-}" \
   --env STARVLA_EMIT_NVTX="${STARVLA_EMIT_NVTX:-}" \
   --env STARVLA_NVTX_ACTION_HEAD="${STARVLA_NVTX_ACTION_HEAD:-}" \

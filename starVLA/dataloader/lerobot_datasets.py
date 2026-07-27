@@ -15,6 +15,10 @@ from starVLA.dataloader.gr00t_lerobot.registry import (
     DATASET_NAMED_MIXTURES,
     EmbodimentTag,
 )
+from starVLA.model.qwenpi_metadata import (
+    build_qwen_batch_layout,
+    metadata_cache_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,13 @@ class QwenVLPreprocessCollate:
         self, processor, cot_prompt=None, pixel_dtype=None, keep_examples=False, pad_to=0
     ):
         self.processor = processor
+        self.image_token_id, self._image_token_id_error = self._resolve_image_token_id(
+            processor
+        )
+        self.spatial_merge_size, self._spatial_merge_size_error = (
+            self._resolve_spatial_merge_size(processor)
+        )
+        self._metadata_compat_warning_emitted = False
         self.cot_prompt = cot_prompt
         self.pixel_dtype = pixel_dtype
         # [OPT #6/#10] Pad token sequences to a fixed length (left padding) so
@@ -52,6 +63,99 @@ class QwenVLPreprocessCollate:
         # eval_action_model) actually needs the raw batch.
         self.keep_examples = keep_examples
 
+    @staticmethod
+    def _resolve_image_token_id(processor):
+        """Resolve the Qwen image placeholder token without touching a batch."""
+        token_id = getattr(processor, "image_token_id", None)
+        source = "processor.image_token_id"
+        if token_id is None:
+            source = "processor.tokenizer.convert_tokens_to_ids('<|image_pad|>')"
+            tokenizer = getattr(processor, "tokenizer", None)
+            converter = getattr(tokenizer, "convert_tokens_to_ids", None)
+            if converter is None:
+                return None, (
+                    "the processor exposes neither image_token_id nor a tokenizer "
+                    "with convert_tokens_to_ids('<|image_pad|>')"
+                )
+            token_id = converter("<|image_pad|>")
+
+        try:
+            token_id = int(token_id)
+        except (TypeError, ValueError):
+            return None, f"{source} returned a non-integer value: {token_id!r}"
+        if token_id < 0:
+            return None, f"{source} returned a negative token id: {token_id}"
+        return token_id, None
+
+    @staticmethod
+    def _resolve_spatial_merge_size(processor):
+        """Resolve the image-token merge factor used by Qwen-VL."""
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is None:
+            return None, "processor.image_processor is missing"
+
+        merge_size = getattr(image_processor, "merge_size", None)
+        source = "processor.image_processor.merge_size"
+        if merge_size is None:
+            merge_size = getattr(image_processor, "spatial_merge_size", None)
+            source = "processor.image_processor.spatial_merge_size"
+        if merge_size is None:
+            return None, (
+                "processor.image_processor exposes neither merge_size nor "
+                "spatial_merge_size"
+            )
+
+        try:
+            merge_size = int(merge_size)
+        except (TypeError, ValueError):
+            return None, f"{source} returned a non-integer value: {merge_size!r}"
+        if merge_size <= 0:
+            return None, f"{source} must be positive, got {merge_size}"
+        return merge_size, None
+
+    def _build_metadata(self, qwen_inputs, image_counts):
+        """Build immutable CPU-only layout metadata for Qwen3.5 batches."""
+        required_fields = {
+            "input_ids",
+            "attention_mask",
+            "mm_token_type_ids",
+            "image_grid_thw",
+        }
+        missing_fields = sorted(required_fields.difference(qwen_inputs))
+        if missing_fields:
+            # Qwen2.5 processors do not emit mm_token_type_ids. Preserve that
+            # path and let the model use its legacy metadata computation.
+            if not self._metadata_compat_warning_emitted:
+                logger.warning(
+                    "[dataloader] metadata cache is enabled, but the processor "
+                    "output is missing %s; skipping the Qwen3.5 metadata "
+                    "descriptor for compatibility with older Qwen-VL models",
+                    ", ".join(missing_fields),
+                )
+                self._metadata_compat_warning_emitted = True
+            return None
+
+        configuration_errors = [
+            error
+            for error in (
+                self._image_token_id_error,
+                self._spatial_merge_size_error,
+            )
+            if error is not None
+        ]
+        if configuration_errors:
+            raise ValueError(
+                "Cannot build Qwen3.5 metadata descriptor: "
+                + "; ".join(configuration_errors)
+            )
+
+        return build_qwen_batch_layout(
+            qwen_inputs,
+            image_counts=image_counts,
+            image_token_id=self.image_token_id,
+            spatial_merge_size=self.spatial_merge_size,
+        )
+
     def __call__(self, batch):
         import numpy as np
         import torch
@@ -59,6 +163,7 @@ class QwenVLPreprocessCollate:
         import time as _time
 
         _t0 = _time.perf_counter()
+        image_counts = [len(ex["image"]) for ex in batch]
         messages = []
         for ex in batch:
             content = [{"type": "image", "image": img} for img in ex["image"]]
@@ -79,10 +184,10 @@ class QwenVLPreprocessCollate:
         # qwen_inputs = the HF processor's full output, a dict of pure torch
         # tensors: input_ids / attention_mask / mm_token_type_ids [B, T]
         # (left-padded to pad_to when set), pixel_values (patch sequences of
-        # ALL images in the batch, optionally pre-cast to bf16 below) and
-        # image_grid_thw [n_images, 3]. No raw PIL.Image / str survives past
-        # this point - Qwen_PI.forward's fast branch just splats this dict
-        # into the VLM after H2D.
+        # ALL images in the batch, optionally pre-cast to bf16 below) and,
+        # while qwen_metadata is built, image_grid_thw [n_images, 3]. The
+        # immutable grid tensor is then removed and reconstructed from the
+        # descriptor's per-rank GPU cache. No raw PIL.Image / str survives.
         qwen_inputs = dict(
             self.processor.apply_chat_template(
                 messages,
@@ -100,6 +205,17 @@ class QwenVLPreprocessCollate:
             "qwen_inputs": qwen_inputs,
             "actions": torch.from_numpy(np.stack([np.asarray(ex["action"]) for ex in batch])),
         }
+        if metadata_cache_enabled():
+            qwen_metadata = self._build_metadata(qwen_inputs, image_counts)
+            if qwen_metadata is not None:
+                # Keep the descriptor separate: qwen_inputs is splatted
+                # directly into the HF model and must remain tensor-only.
+                out["qwen_metadata"] = qwen_metadata
+                # The grid is immutable layout metadata. Removing its CPU
+                # tensor here prevents Accelerate from copying it to CUDA on
+                # every batch; Qwen_PI materializes one per-rank device copy
+                # from qwen_metadata and reuses it through the bounded cache.
+                qwen_inputs.pop("image_grid_thw")
         if self.keep_examples:
             out["examples"] = batch
         if "state" in batch[0]:
