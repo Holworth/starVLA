@@ -7,10 +7,12 @@ import time
 import torch
 import starVLA.training.train_starvla as T
 from starVLA.model.framework.VLM4A.QwenPI import Qwen_PI
+from starVLA.model.qwenpi_metadata import env_bool
 
 START = int(os.environ.get("STARVLA_PROFILE_START_STEP", "11"))
 END = int(os.environ.get("STARVLA_PROFILE_END_STEP", "13"))
 CAPTURE_ENABLED = START > 0 and END >= START
+BENCHMARK_WINDOW = env_bool("STARVLA_BENCHMARK_WINDOW")
 TRIGGER = os.environ.get("STARVLA_PROFILE_TRIGGER", "nvtx").lower()
 NSYS_BIN = os.environ.get("STARVLA_NSYS_BIN")
 NSYS_SESSION = os.environ.get("STARVLA_NSYS_SESSION")
@@ -37,12 +39,31 @@ def _cuda_profiler(command):
     if err != 0:
         raise RuntimeError(f"cudaProfiler{command.title()} failed with CUDA error {err}")
 
-_st = {"i": 0, "on": False}
+if BENCHMARK_WINDOW and (not CAPTURE_ENABLED or END <= START):
+    raise ValueError(
+        "STARVLA_BENCHMARK_WINDOW requires a positive profile window with END > START"
+    )
+
+_st = {"i": 0, "on": False, "benchmark_start": None}
 _emit = {"cm": None}
 
 _orig_step = T.VLATrainer._train_step
 def _train_step(self, *a, **k):
     step = _st["i"] + 1
+    if BENCHMARK_WINDOW and step == START:
+        torch.cuda.synchronize()
+        _st["benchmark_start"] = time.perf_counter()
+    elif BENCHMARK_WINDOW and step == END:
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - _st["benchmark_start"]
+        intervals = END - START
+        if LOCAL_RANK == 0:
+            print(
+                "[perf_window] "
+                f"start_step={START} end_step={END} intervals={intervals} "
+                f"elapsed_s={elapsed:.9f} step_s={elapsed / intervals:.9f}",
+                flush=True,
+            )
     if CAPTURE_ENABLED and step == START:
         print(f"[nvtx_patch] rank {LOCAL_RANK} profiler start at train_step_{step} (trigger={TRIGGER})", flush=True)
         if TRIGGER == "cuda":
@@ -64,7 +85,7 @@ def _train_step(self, *a, **k):
         # not pass through the dispatcher at replay time and get no aten
         # ranges - run the eager config when full GEMM/attention shape
         # coverage is needed.
-        if os.environ.get("STARVLA_EMIT_NVTX"):
+        if env_bool("STARVLA_EMIT_NVTX"):
             _emit["cm"] = torch.autograd.profiler.emit_nvtx(record_shapes=True)
             _emit["cm"].__enter__()
     torch.cuda.nvtx.range_push(f"train_step_{step}")
@@ -114,7 +135,7 @@ Qwen_PI.forward = _forward
 # OUTPUT (backward enters the head), pop once ALL marked INPUTS (hidden_states +
 # every per-layer encoder tensor) have received their grads (backward leaves the
 # head and the VLM's backward can begin).
-if os.environ.get("STARVLA_NVTX_ACTION_HEAD"):
+if env_bool("STARVLA_NVTX_ACTION_HEAD"):
     from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import (
         LayerwiseFlowmatchingActionHead as _LFM,
     )

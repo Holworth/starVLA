@@ -33,19 +33,28 @@
 # Compile mode override: STARVLA_FUSED_COMPILE_MODE (default reduce-overhead).
 import os
 import sys
+from contextvars import ContextVar
 
 import torch
 import transformers.models.qwen3_5.modeling_qwen3_5 as _m
 
 from starVLA.model.qwenpi_metadata import (
     VisionEntry,
+    build_causal_mask_from_layout,
     device_key,
     env_bool,
     get_active_qwen_metadata,
+    metadata_cache_enabled,
 )
 
 _orig_forward = _m.Qwen3_5TextModel.forward
 _check_metadata_cache = env_bool("STARVLA_CHECK_METADATA_CACHE")
+_fused_text_stack_on = env_bool("STARVLA_FUSED_TEXT_STACK", default=True)
+_metadata_cache_on = metadata_cache_enabled()
+_vit_input_cache_on = env_bool("STARVLA_VIT_INPUT_CACHE")
+_FORCE_HF_QWEN_PATH: ContextVar[bool] = ContextVar(
+    "starvla_force_hf_qwen_path", default=False
+)
 
 
 def _constant_fold_fla_device_checks():
@@ -93,7 +102,7 @@ def _constant_fold_fla_device_checks():
                 mod.get_multiprocessor_count = _const_get_multiprocessor_count
 
 
-if env_bool("STARVLA_FLA_TRACE"):
+if _fused_text_stack_on and env_bool("STARVLA_FLA_TRACE"):
     _constant_fold_fla_device_checks()
     print("[fused_text_stack_patch] fla device checks constant-folded (STARVLA_FLA_TRACE)", flush=True)
 
@@ -265,8 +274,23 @@ def _fused_forward(
     cache_position=None,
     **kwargs,
 ):
-    # Cached / generation / checkpointed paths keep the stock implementation.
-    if past_key_values is not None or use_cache or (self.gradient_checkpointing and self.training):
+    return_dict = kwargs.get("return_dict")
+    if return_dict is None:
+        return_dict = getattr(self.config, "use_return_dict", True)
+    output_attentions = kwargs.get("output_attentions")
+    if output_attentions is None:
+        output_attentions = getattr(self.config, "output_attentions", False)
+
+    # Cached, generation, checkpointed, tuple and attention-diagnostic paths
+    # keep the decorated stock implementation.
+    if (
+        _FORCE_HF_QWEN_PATH.get()
+        or past_key_values is not None
+        or use_cache
+        or (self.gradient_checkpointing and self.training)
+        or not return_dict
+        or output_attentions
+    ):
         return _orig_forward(
             self,
             input_ids=input_ids,
@@ -332,42 +356,31 @@ def _fused_forward(
                 f"descriptor={expected_shape}, tensor={tuple(inputs_embeds.shape[:2])}"
             )
 
-        # HF's SDPA mask for this no-cache, full-attention training shape is
-        # exactly `(key <= query) & attention_mask[key]`.  Building the mask
-        # from the worker-produced immutable bytes avoids the
-        # `padding_mask.all()` GPU->CPU synchronization in
-        # `_ignore_causal_mask_sdpa`.  Values are cached per sample because
-        # padding patterns repeat even when whole batches do not.
+        # Reusing worker mask bytes avoids HF's padding_mask.all() D2H sync.
+        all_visible_bytes = b"\x01" * layout.seq_len
         all_visible = all(
-            sample.attention_mask_u8 == b"\x01" * layout.seq_len
+            sample.attention_mask_u8 == all_visible_bytes
             for sample in layout.samples
         )
+        mask_misses = 0
         if all_visible:
-            # Matches create_causal_mask's is_causal fast path when the whole
-            # batch is unpadded.
             causal_mask = None
         else:
             dev_key = device_key(inputs_embeds)
 
             def _sample_mask(sample):
-                key = ("causal", sample.seq_len, sample.attention_mask_u8, dev_key)
+                key = (sample.attention_mask_u8, dev_key)
 
                 def _build():
-                    valid_keys = torch.tensor(
-                        tuple(sample.attention_mask_u8),
-                        dtype=torch.bool,
-                        device=inputs_embeds.device,
-                    )
-                    positions = torch.arange(sample.seq_len, device=inputs_embeds.device)
-                    lower_triangle = positions[:, None] >= positions[None, :]
-                    return (lower_triangle & valid_keys[None, :]).unsqueeze(0).unsqueeze(0)
+                    nonlocal mask_misses
+                    mask_misses += 1
+                    return build_causal_mask_from_layout(sample, inputs_embeds.device)
 
                 return active.cache.causal_masks.get_or_create(key, _build)
 
             causal_mask = torch.cat([_sample_mask(sample) for sample in layout.samples], dim=0)
-        if _check_metadata_cache and not getattr(
-            self, "_starvla_metadata_causal_checked", False
-        ):
+        # All-visible batches create no entry and therefore cannot consume a check.
+        if _check_metadata_cache and mask_misses:
             reference_mask = _m.create_causal_mask(
                 config=self.config,
                 inputs_embeds=inputs_embeds,
@@ -376,19 +389,13 @@ def _fused_forward(
                 past_key_values=None,
                 position_ids=text_position_ids,
             )
-            masks_match = (
-                reference_mask is None
-                if causal_mask is None
-                else reference_mask is not None
-                and torch.equal(reference_mask, causal_mask)
-            )
-            if not masks_match:
+            if reference_mask is None or not torch.equal(reference_mask, causal_mask):
                 raise RuntimeError(
                     "[metadata_cache] cached causal mask does not match HF"
                 )
-            self._starvla_metadata_causal_checked = True
             print(
-                "[fused_text_stack_patch] metadata check: causal mask OK",
+                "[fused_text_stack_patch] metadata check: "
+                f"{mask_misses} causal-mask miss(es) OK",
                 flush=True,
             )
     # HF's _update_linear_attn_mask runs torch.all(attention_mask==1)
@@ -416,8 +423,15 @@ def _fused_forward(
     return out
 
 
-_m.Qwen3_5TextModel.forward = _fused_forward
-print("[fused_text_stack_patch] applied", flush=True)
+if _fused_text_stack_on:
+    _m.Qwen3_5TextModel.forward = _fused_forward
+    print("[fused_text_stack_patch] text-stack patch installed", flush=True)
+else:
+    print(
+        "[fused_text_stack_patch] inactive "
+        "(STARVLA_FUSED_TEXT_STACK is false)",
+        flush=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -491,60 +505,8 @@ def _patch_vision_tower():
 
     _orig_vm_forward = _m.Qwen3_5VisionModel.forward
 
-    # ViT input-structure cache (STARVLA_VIT_INPUT_CACHE=1). Everything the
-    # HF vision preamble derives from grid_thw alone is grid-constant across
-    # steps in this workload (static resize -> identical grid_thw bytes every
-    # batch): the rotary cos/sin tables, cu_seqlens, max_seqlen, and — the
-    # expensive one — the pos-embed interpolation STRUCTURE. HF's
-    # fast_pos_embed_interpolate rebuilds python lists per image per step
-    # (grid.tolist() D2H sync + 4x len-16k list extends + torch.tensor H2D);
-    # at bs32 the whole preamble is ~90 ms of exposed CPU (716 memcpys, 587
-    # stream syncs). Only the gather from the TRAINABLE self.pos_embed.weight
-    # must run every step, so we cache (idx, weight, perm) and reduce the
-    # per-step work to gather * weight -> sum -> index_select, which keeps
-    # the autograd path to pos_embed.weight intact. The optional metadata
-    # correctness check verifies the cached path against HF once.
-    _vit_input_cache_on = env_bool("STARVLA_VIT_INPUT_CACHE")
-
-    def _rotary_from_grids(self, grids):
-        """Mirror Qwen3_5VisionModel.rot_pos_emb without a GPU tolist()."""
-
-        merge_size = self.spatial_merge_size
-        max_hw = max(max(height, width) for _, height, width in grids)
-        freq_table = self.rotary_pos_emb(max_hw)
-        device = freq_table.device
-        total_tokens = sum(t * h * w for t, h, w in grids)
-        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
-        offset = 0
-        for num_frames, height, width in grids:
-            merged_height = height // merge_size
-            merged_width = width // merge_size
-            block_rows = torch.arange(merged_height, device=device)
-            block_cols = torch.arange(merged_width, device=device)
-            intra_rows = torch.arange(merge_size, device=device)
-            intra_cols = torch.arange(merge_size, device=device)
-            row_ids = (
-                block_rows[:, None, None, None] * merge_size
-                + intra_rows[None, None, :, None]
-            )
-            col_ids = (
-                block_cols[None, :, None, None] * merge_size
-                + intra_cols[None, None, None, :]
-            )
-            row_ids = row_ids.expand(
-                merged_height, merged_width, merge_size, merge_size
-            ).reshape(-1)
-            col_ids = col_ids.expand(
-                merged_height, merged_width, merge_size, merge_size
-            ).reshape(-1)
-            coordinates = torch.stack((row_ids, col_ids), dim=-1)
-            if num_frames > 1:
-                coordinates = coordinates.repeat(num_frames, 1)
-            num_tokens = coordinates.shape[0]
-            pos_ids[offset : offset + num_tokens] = coordinates
-            offset += num_tokens
-        return freq_table[pos_ids].flatten(1)
-
+    # Cache only grid-derived ViT structure. The trainable position embedding
+    # gather remains live on every step so gradients still reach its weights.
     def _build_vit_input_entry(self, grid_thw, vision):
         device = self.pos_embed.weight.device
         weight_dtype = self.pos_embed.weight.dtype
@@ -601,7 +563,13 @@ def _patch_vision_tower():
         permutation = torch.cat(permutation_parts).to(device)
 
         with torch.no_grad():
-            rotary = _rotary_from_grids(self, grids)
+            # Reuse HF's exact rotary implementation. Its only `.tolist()` is
+            # performed on this explicitly CPU tensor, while the frequency
+            # table and generated position ids remain on the model device.
+            cpu_grid = torch.tensor(
+                grids, dtype=torch.long, device="cpu"
+            ).reshape(-1, 3)
+            rotary = self.rot_pos_emb(cpu_grid)
             seq_len = rotary.shape[0]
             rotary = rotary.reshape(seq_len, -1)
             doubled = torch.cat((rotary, rotary), dim=-1)
@@ -619,14 +587,9 @@ def _patch_vision_tower():
             cos=cos,
             sin=sin,
             cu_seqlens=cu_seqlens,
-            max_seqlen=vision.max_seqlen,
         )
 
-        if _check_metadata_cache and not getattr(
-            self, "_starvla_metadata_vision_checked", False
-        ):
-            # This is intentionally the only vision path that reads GPU
-            # metadata back.  It is opt-in and runs once for validation.
+        if _check_metadata_cache:
             actual_grids = tuple(
                 tuple(int(value) for value in row)
                 for row in grid_thw.cpu().tolist()
@@ -639,9 +602,7 @@ def _patch_vision_tower():
             with torch.no_grad():
                 reference_pos = self.fast_pos_embed_interpolate(grid_thw).float()
                 pos = self.pos_embed(entry.idx) * entry.weights[:, :, None]
-                cached_pos = (
-                    pos[0] + pos[1] + pos[2] + pos[3]
-                ).index_select(0, entry.permutation).float()
+                cached_pos = sum(pos).index_select(0, entry.permutation).float()
                 pos_error = (reference_pos - cached_pos).abs().max().item()
                 reference_rotary = self.rot_pos_emb(grid_thw).reshape(seq_len, -1)
                 rotary_error = (reference_rotary - rotary).abs().max().item()
@@ -656,27 +617,153 @@ def _patch_vision_tower():
                     f"pos_error={pos_error}, rotary_error={rotary_error}, "
                     f"cu_seqlens_equal={cu_matches}"
                 )
-            self._starvla_metadata_vision_checked = True
-            print("[fused_text_stack_patch] metadata check: vision OK", flush=True)
+            print(
+                "[fused_text_stack_patch] metadata check: vision key OK",
+                flush=True,
+            )
         return entry
 
-    def _fallback_vm_forward(self, hidden_states, grid_thw, **kwargs):
+    def _log_vision_path_once(self, key, message):
+        logged = getattr(self, "_starvla_vision_path_logs", None)
+        if logged is None:
+            logged = set()
+            self._starvla_vision_path_logs = logged
+        if key not in logged:
+            logged.add(key)
+            print(f"[fused_text_stack_patch] {message}", flush=True)
+
+    def _fallback_vm_forward(self, hidden_states, grid_thw, *, reason, **kwargs):
         # Attention is patched globally; clear a value stamped by a previous
-        # fast-path call before using the stock HF vision preamble.
+        # compiled call before restoring the complete decorated HF forward.
         for block in self.blocks:
             block.attn._starvla_max_seqlen = None
+        _log_vision_path_once(
+            self,
+            f"hf:{reason}",
+            f"vision: full HF fallback ({reason})",
+        )
         return _orig_vm_forward(self, hidden_states, grid_thw, **kwargs)
 
+    def _run_compiled_vision(
+        self, hidden_states, cu_seqlens, cos, sin, max_seqlen
+    ):
+        # Flash Attention needs max_seqlen as a host-side integer while the
+        # blocks are traced.  Both metadata and stock-preamble paths resolve it
+        # before entering this common compiled region.
+        for block in self.blocks:
+            block.attn._starvla_max_seqlen = max_seqlen
+
+        runner = getattr(self, "_starvla_vis_runner", None)
+        if runner is None:
+            blocks = tuple(self.blocks)
+            block_forward = _m.Qwen3_5VisionBlock.forward
+
+            def _run_blocks(states, cached_cu_seqlens, cached_cos, cached_sin):
+                for block in blocks:
+                    states = block_forward(
+                        block,
+                        states,
+                        cu_seqlens=cached_cu_seqlens,
+                        position_embeddings=(cached_cos, cached_sin),
+                    )
+                return states
+
+            runner = torch.compile(
+                _run_blocks, dynamic=False, mode="reduce-overhead"
+            )
+            self._starvla_vis_runner = runner
+
+        hidden_states = runner(hidden_states, cu_seqlens, cos, sin)
+        merged_hidden_states = self.merger(hidden_states)
+        return _m.BaseModelOutputWithPooling(
+            last_hidden_state=hidden_states,
+            pooler_output=merged_hidden_states,
+        )
+
+    def _stock_preamble_compiled_forward(self, hidden_states, grid_thw):
+        """Keep HF's preamble but retain the compiled FA2 block runner."""
+
+        hidden_states = self.patch_embed(hidden_states)
+        hidden_states = hidden_states + self.fast_pos_embed_interpolate(grid_thw)
+
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        doubled = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        cos, sin = doubled.cos(), doubled.sin()
+
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(
+            dim=0,
+            dtype=grid_thw.dtype if torch.jit.is_tracing() else torch.int32,
+        )
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        # This rollback path intentionally keeps the stock GPU-derived
+        # preamble.  Its one scalar readback is outside the compiled blocks and
+        # is preferable to silently disabling the compiled vision tower.
+        max_seqlen = int(
+            (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        )
+        _log_vision_path_once(
+            self,
+            "stock-preamble",
+            "vision: stock preamble + compiled FA2 blocks "
+            "(metadata preamble cache inactive)",
+        )
+        return _run_compiled_vision(
+            self, hidden_states, cu_seqlens, cos, sin, max_seqlen
+        )
+
     def _vm_forward(self, hidden_states, grid_thw, **kwargs):
-        active = get_active_qwen_metadata()
+        if _FORCE_HF_QWEN_PATH.get():
+            return _fallback_vm_forward(
+                self,
+                hidden_states,
+                grid_thw,
+                reason="top-level Qwen fallback",
+                **kwargs,
+            )
+        output_hidden_states = kwargs.get("output_hidden_states")
+        if output_hidden_states is None:
+            output_hidden_states = getattr(
+                self.config, "output_hidden_states", False
+            )
+        output_attentions = kwargs.get("output_attentions")
+        if output_attentions is None:
+            output_attentions = getattr(
+                self.config, "output_attentions", False
+            )
+        return_dict = kwargs.get("return_dict")
+        if return_dict is None:
+            return_dict = getattr(self.config, "use_return_dict", True)
+        if not _m.is_flash_attention_requested(self.config):
+            return _fallback_vm_forward(
+                self,
+                hidden_states,
+                grid_thw,
+                reason="attention backend is not Flash Attention",
+                **kwargs,
+            )
         if (
-            active is None
-            or not _vit_input_cache_on
-            or not _m.is_flash_attention_requested(self.config)
-            or kwargs.get("output_hidden_states")
-            or kwargs.get("output_attentions")
+            output_hidden_states
+            or output_attentions
+            or not return_dict
         ):
-            return _fallback_vm_forward(self, hidden_states, grid_thw, **kwargs)
+            return _fallback_vm_forward(
+                self,
+                hidden_states,
+                grid_thw,
+                reason="diagnostic or tuple output requested",
+                **kwargs,
+            )
+
+        active = get_active_qwen_metadata()
+        if active is None or not _vit_input_cache_on:
+            return _stock_preamble_compiled_forward(
+                self, hidden_states, grid_thw
+            )
 
         vision = active.layout.vision
         if not vision.grids:
@@ -702,14 +789,17 @@ def _patch_vision_tower():
 
         hidden_states = self.patch_embed(hidden_states)
         cache_key = (
-            "vision",
             vision,
             device_key(self.pos_embed.weight),
             self.pos_embed.weight.dtype,
-            self.num_grid_per_side,
         )
         entry = active.cache.vision_batches.get_or_create(
             cache_key, lambda: _build_vit_input_entry(self, grid_thw, vision)
+        )
+        _log_vision_path_once(
+            self,
+            "metadata-preamble",
+            "vision: metadata preamble cache + compiled FA2 blocks",
         )
 
         # Keep the gather live so gradients reach the trainable position table.
@@ -720,166 +810,30 @@ def _patch_vision_tower():
         hidden_states = hidden_states + pos_embeds
         seq_len, _ = hidden_states.size()
         hidden_states = hidden_states.reshape(seq_len, -1)
-        for block in self.blocks:
-            block.attn._starvla_max_seqlen = entry.max_seqlen
-
-        runner = getattr(self, "_starvla_vis_runner", None)
-        if runner is None:
-            blocks = tuple(self.blocks)
-            block_forward = _m.Qwen3_5VisionBlock.forward
-
-            def _run_blocks(states, cu_seqlens, cos, sin):
-                for block in blocks:
-                    states = block_forward(
-                        block,
-                        states,
-                        cu_seqlens=cu_seqlens,
-                        position_embeddings=(cos, sin),
-                    )
-                return states
-
-            runner = torch.compile(_run_blocks, dynamic=False, mode="reduce-overhead")
-            self._starvla_vis_runner = runner
-
-        hidden_states = runner(
-            hidden_states, entry.cu_seqlens, entry.cos, entry.sin
-        )
-        merged_hidden_states = self.merger(hidden_states)
-        return _m.BaseModelOutputWithPooling(
-            last_hidden_state=hidden_states,
-            pooler_output=merged_hidden_states,
+        return _run_compiled_vision(
+            self,
+            hidden_states,
+            entry.cu_seqlens,
+            entry.cos,
+            entry.sin,
+            vision.max_seqlen,
         )
 
     _m.Qwen3_5VisionModel.forward = _vm_forward
 
-    # The vision->text split sizes are part of the same descriptor.  Keep the
-    # fast path narrow so tuple-return and diagnostic HF calls retain the
-    # exact original behavior.
-    _orig_gif = _m.Qwen3_5Model.get_image_features
 
-    def _gif_cached(self, pixel_values, image_grid_thw=None, **kwargs):
-        active = get_active_qwen_metadata()
-        if (
-            active is None
-            or not _vit_input_cache_on
-            or image_grid_thw is None
-            or kwargs.get("return_dict", True) is False
-        ):
-            return _orig_gif(
-                self, pixel_values, image_grid_thw=image_grid_thw, **kwargs
-            )
-
-        split_sizes = active.layout.vision.split_sizes
-        if len(split_sizes) != image_grid_thw.shape[0]:
-            raise RuntimeError(
-                "active Qwen metadata split sizes do not match image_grid_thw: "
-                f"{len(split_sizes)} != {image_grid_thw.shape[0]}"
-            )
-        if _check_metadata_cache and not getattr(
-            self, "_starvla_metadata_split_checked", False
-        ):
-            reference = tuple(
-                (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2)
-                .cpu()
-                .tolist()
-            )
-            if reference != split_sizes:
-                raise RuntimeError(
-                    f"[metadata_cache] split sizes mismatch: {split_sizes} != {reference}"
-                )
-            self._starvla_metadata_split_checked = True
-            print(
-                "[fused_text_stack_patch] metadata check: split sizes OK",
-                flush=True,
-            )
-
-        visual_kwargs = dict(kwargs)
-        visual_kwargs.pop("return_dict", None)
-        pixel_values = pixel_values.type(self.visual.dtype)
-        vision_output = self.visual(
-            pixel_values,
-            grid_thw=image_grid_thw,
-            return_dict=True,
-            **visual_kwargs,
-        )
-        vision_output.pooler_output = torch.split(
-            vision_output.pooler_output, split_sizes
-        )
-        return vision_output
-
-    _m.Qwen3_5Model.get_image_features = _gif_cached
-
-
-if env_bool("STARVLA_FUSED_VISION"):
+if _fused_text_stack_on and env_bool("STARVLA_FUSED_VISION"):
     _patch_vision_tower()
-    print("[fused_text_stack_patch] vision tower fused (STARVLA_FUSED_VISION)", flush=True)
+    print(
+        "[fused_text_stack_patch] vision patch installed "
+        "(FA2 compiled blocks; metadata_preamble_cache="
+        f"{'on' if _metadata_cache_on and _vit_input_cache_on else 'off'})",
+        flush=True,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Sync-free multimodal embedding merge (STARVLA_FAST_MM_MERGE=1).
-#
-# HF's Qwen3_5Model.get_placeholder_mask validates that the number of image
-# placeholder tokens matches the vision features via
-# `inputs_embeds[special_image_mask].numel() == image_features.numel()` — a
-# boolean-mask gather (cub DeviceSelect) followed by a host bool() readback,
-# i.e. one more CPU<->GPU round trip per modality per step, sitting exactly
-# in the exposed gap between the vision graph and the first text-stack graph
-# (milestone4 step-40: ~150 tiny D2H syncs in 16 ms there, shared with the
-# in-model MRoPE compute that the MRoPE position-id cache removes).
-#
-# The fast path keeps the mask computation (pure GPU, async) and DROPS the
-# validation. Trade-off: a genuine token/feature count mismatch would surface
-# as a shifted masked_scatter instead of a clean error — enable only with a
-# processor/collate combination that has been validated once (e.g. with the
-# stock path or STARVLA_CHECK_POSIDS runs).
-# ---------------------------------------------------------------------------
-
-
-def _patch_mm_merge():
-    def _fast_placeholder_mask(self, input_ids, inputs_embeds, image_features=None, video_features=None):
-        if input_ids is None or get_active_qwen_metadata() is None:
-            return _orig_placeholder_mask(
-                self,
-                input_ids,
-                inputs_embeds,
-                image_features=image_features,
-                video_features=video_features,
-            )
-        special_image_mask = (input_ids == self.config.image_token_id)
-        special_video_mask = (input_ids == self.config.video_token_id)
-        special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        special_video_mask = special_video_mask.unsqueeze(-1).expand_as(inputs_embeds)
-        return special_image_mask, special_video_mask
-
-    _orig_placeholder_mask = _m.Qwen3_5Model.get_placeholder_mask
-    _m.Qwen3_5Model.get_placeholder_mask = _fast_placeholder_mask
-
-
-if env_bool("STARVLA_FAST_MM_MERGE"):
-    _patch_mm_merge()
-    print("[fused_text_stack_patch] sync-free mm merge (STARVLA_FAST_MM_MERGE)", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Index-based multimodal merge (STARVLA_INDEX_MM_MERGE=1).
-#
-# masked_scatter's BACKWARD runs grad.masked_select(mask) -> torch.nonzero,
-# which must count the mask's nonzeros and read that count back to the CPU:
-# one 4-byte DtoH + cudaStreamSynchronize per step, landing at the deepest
-# point of the backward queue. Measured on milestone1: the autograd thread
-# stalls ~63 ms behind the stream-7 backlog, freezing the ZeRO-2 bucket
-# hooks so allreduce buckets 4-6 pile up at the step tail (the direct cause
-# of the exposed-allreduce pattern). The sync-free forward-side merge
-# (STARVLA_FAST_MM_MERGE) only removed the forward validation readback - the
-# nonzero was deferred, not removed.
-#
-# Fix: the dataloader worker records the image-token positions as immutable
-# flat indices in QwenBatchLayout.  The model copies each repeated index tuple
-# into a bounded per-rank device cache and merges with index_copy; its backward
-# is index_select, with no nonzero and no synchronization.  Comparing the
-# descriptor length with image_embeds.shape[0] restores count validation using
-# host-side shape integers only.
-# ---------------------------------------------------------------------------
+# Index-copy avoids masked_scatter backward's nonzero/D2H synchronization.
+# The worker layout supplies validated flat image-token positions.
 
 
 def _patch_index_mm_merge():
@@ -891,9 +845,40 @@ def _patch_index_mm_merge():
         # Only the image-only training shape takes the fast path; anything
         # else (embeds-only, video, generation) keeps stock behavior.
         active = get_active_qwen_metadata()
+
+        def _call_original_model():
+            return _orig_model_forward(
+                self,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                mm_token_type_ids=mm_token_type_ids,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        # No descriptor means there is no metadata state to hide.  Let stock
+        # Qwen perform the merge while its vision/text submodules retain their
+        # independent patched paths (notably stock preamble + compiled FA2).
+        if active is None:
+            return _call_original_model()
+
+        return_dict = kwargs.get("return_dict")
+        if return_dict is None:
+            return_dict = getattr(self.config, "use_return_dict", True)
+        output_attentions = kwargs.get("output_attentions")
+        if output_attentions is None:
+            output_attentions = getattr(
+                self.config, "output_attentions", False
+            )
         if (
-            active is None
-            or kwargs.get("return_dict", True) is False
+            not return_dict
             or input_ids is None
             or inputs_embeds is not None
             or pixel_values is None
@@ -902,13 +887,13 @@ def _patch_index_mm_merge():
             or video_grid_thw is not None
             or past_key_values is not None
             or kwargs.get("use_cache")
+            or output_attentions
         ):
-            return _orig_model_forward(
-                self, input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
-                past_key_values=past_key_values, inputs_embeds=inputs_embeds, pixel_values=pixel_values,
-                pixel_values_videos=pixel_values_videos, image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw, mm_token_type_ids=mm_token_type_ids,
-                cache_position=cache_position, **kwargs)
+            token = _FORCE_HF_QWEN_PATH.set(True)
+            try:
+                return _call_original_model()
+            finally:
+                _FORCE_HF_QWEN_PATH.reset(token)
 
         layout = active.layout
         if tuple(input_ids.shape) != (layout.batch_size, layout.seq_len):
@@ -918,47 +903,49 @@ def _patch_index_mm_merge():
                 f"tensor={tuple(input_ids.shape)}"
             )
         inputs_embeds = self.get_input_embeddings()(input_ids)
-        image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
-        image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+        # Stock get_image_features splits the raw visual output per image, and
+        # Qwen3_5Model.forward immediately concatenates those pieces again.
+        # The index merge consumes the flat tensor directly, avoiding both that
+        # split/cat pair and a broad get_image_features monkey patch.
+        image_outputs = self.visual(
+            pixel_values.type(self.visual.dtype),
+            grid_thw=image_grid_thw,
+            return_dict=True,
+        )
+        image_embeds = image_outputs.pooler_output.to(
+            inputs_embeds.device, inputs_embeds.dtype
+        )
 
         flat_indices = layout.flat_image_token_indices
-        index_key = (
-            "image_indices",
-            layout.batch_size,
-            layout.seq_len,
-            flat_indices,
-            device_key(input_ids),
-        )
-        idx = active.cache.image_indices.get_or_create(
-            index_key,
-            lambda: torch.tensor(
-                flat_indices, dtype=torch.long, device=input_ids.device
-            ),
-        )
         if len(flat_indices) != image_embeds.shape[0]:
             raise RuntimeError(
                 f"image token count ({len(flat_indices)}) != vision features "
                 f"({image_embeds.shape[0]}); processor/collate mismatch"
             )
-        if _check_metadata_cache and not getattr(
-            self, "_starvla_metadata_indices_checked", False
-        ):
-            reference = tuple(
-                (input_ids.cpu().view(-1) == self.config.image_token_id)
-                .nonzero(as_tuple=False)
-                .squeeze(1)
-                .tolist()
-            )
-            if reference != flat_indices:
-                raise RuntimeError(
-                    "[metadata_cache] image indices mismatch: "
-                    f"descriptor={flat_indices}, tensor={reference}"
+        index_key = (flat_indices, device_key(input_ids))
+
+        def _build_image_indices():
+            if _check_metadata_cache:
+                reference = tuple(
+                    (input_ids.cpu().view(-1) == self.config.image_token_id)
+                    .nonzero(as_tuple=False)
+                    .squeeze(1)
+                    .tolist()
                 )
-            self._starvla_metadata_indices_checked = True
-            print(
-                "[fused_text_stack_patch] metadata check: image indices OK",
-                flush=True,
+                if reference != flat_indices:
+                    raise RuntimeError(
+                        "[metadata_cache] image indices mismatch: "
+                        f"descriptor={flat_indices}, tensor={reference}"
+                    )
+                print("[fused_text_stack_patch] metadata check: image-index miss OK", flush=True)
+            return torch.tensor(
+                flat_indices, dtype=torch.long, device=input_ids.device
             )
+
+        idx = active.cache.image_indices.get_or_create(
+            index_key,
+            _build_image_indices,
+        )
         b, t, h = inputs_embeds.shape
         inputs_embeds = inputs_embeds.view(-1, h).index_copy(0, idx, image_embeds).view(b, t, h)
 
@@ -977,6 +964,24 @@ def _patch_index_mm_merge():
     _m.Qwen3_5Model.forward = _mm_forward
 
 
-if env_bool("STARVLA_INDEX_MM_MERGE"):
+_index_mm_merge_requested = env_bool("STARVLA_INDEX_MM_MERGE")
+if _fused_text_stack_on and _metadata_cache_on and _index_mm_merge_requested:
     _patch_index_mm_merge()
-    print("[fused_text_stack_patch] index-based mm merge (STARVLA_INDEX_MM_MERGE)", flush=True)
+    print(
+        "[fused_text_stack_patch] index merge patch installed "
+        "(effective with active Qwen metadata)",
+        flush=True,
+    )
+elif _fused_text_stack_on and _index_mm_merge_requested:
+    print(
+        "[fused_text_stack_patch] index merge inactive "
+        "(STARVLA_METADATA_CACHE is false)",
+        flush=True,
+    )
+
+if _fused_text_stack_on and env_bool("STARVLA_FAST_MM_MERGE"):
+    print(
+        "[fused_text_stack_patch] STARVLA_FAST_MM_MERGE is retired; "
+        "no placeholder-mask patch was installed",
+        flush=True,
+    )

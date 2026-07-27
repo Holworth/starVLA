@@ -32,6 +32,7 @@ from starVLA.model.qwenpi_metadata import (
     QwenBatchLayout,
     QwenMetadataCache,
     activate_qwen_metadata,
+    device_key,
     env_bool,
     metadata_cache_enabled,
 )
@@ -180,13 +181,39 @@ class Qwen_PI(baseframework):
         # cache and avoids attaching ad-hoc dictionaries to HF submodules.
         self._metadata_cache_enabled = metadata_cache_enabled()
         self._metadata_cache = QwenMetadataCache()
-        self._mrope_cache_enabled = (
-            str(self.config.framework.qwenvl.get("mrope_posid_cache", False)).lower() in ("true", "1")
+        mrope_cache_requested = (
+            str(self.config.framework.qwenvl.get("mrope_posid_cache", False))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
         )
+        self._mrope_cache_enabled = (
+            self._metadata_cache_enabled and mrope_cache_requested
+        )
+        if mrope_cache_requested and not self._metadata_cache_enabled:
+            logger.warning(
+                "Qwen MRoPE caching was requested, but STARVLA_METADATA_CACHE "
+                "is disabled; falling back to Hugging Face MRoPE computation."
+            )
 
-    @staticmethod
-    def _device_key(device: torch.device) -> tuple[str, int | None]:
-        return device.type, device.index
+    def _validate_metadata_layout(self, layout, qwen_inputs):
+        """Reject a processor descriptor incompatible with the loaded model."""
+
+        input_ids = qwen_inputs.get("input_ids")
+        expected_shape = (layout.batch_size, layout.seq_len)
+        if not torch.is_tensor(input_ids) or tuple(input_ids.shape) != expected_shape:
+            actual_shape = tuple(input_ids.shape) if torch.is_tensor(input_ids) else None
+            raise RuntimeError(
+                "Qwen metadata shape does not match input_ids: "
+                f"descriptor={expected_shape}, tensor={actual_shape}"
+            )
+        inner = self.qwen_vl_interface.model.model
+        model_merge_size = int(inner.config.vision_config.spatial_merge_size)
+        if layout.spatial_merge_size != model_merge_size:
+            raise RuntimeError(
+                "Qwen metadata spatial_merge_size does not match the model: "
+                f"descriptor={layout.spatial_merge_size}, model={model_merge_size}"
+            )
 
     def _copy_qwen_inputs_to_device(self, cpu_inputs, layout, device):
         """Copy dynamic inputs and reuse layout-only grid tensors.
@@ -196,25 +223,23 @@ class Qwen_PI(baseframework):
         steps reuse the exact device tensor.
         """
         qwen_inputs = {}
-        grid_dtype = torch.long
         for key, value in cpu_inputs.items():
             if key == "image_grid_thw" and layout is not None:
-                if torch.is_tensor(value):
-                    grid_dtype = value.dtype
                 continue
             qwen_inputs[key] = (
                 value.to(device, non_blocking=True) if torch.is_tensor(value) else value
             )
         if layout is not None:
-            cache_key = (layout.vision, self._device_key(device), grid_dtype)
-            device_grid = self._metadata_cache.grid_tensors.get(cache_key)
-            if device_grid is None:
-                device_grid = torch.tensor(
-                    layout.vision.grids,
-                    dtype=grid_dtype,
+            grids = layout.vision.grids
+            cache_key = (grids, device_key(device))
+            device_grid = self._metadata_cache.grid_tensors.get_or_create(
+                cache_key,
+                lambda: torch.tensor(
+                    grids,
+                    dtype=torch.long,
                     device=device,
-                ).reshape(-1, 3)
-                self._metadata_cache.grid_tensors.put(cache_key, device_grid)
+                ).reshape(-1, 3),
+            )
             qwen_inputs["image_grid_thw"] = device_grid
         return qwen_inputs
 
@@ -227,12 +252,12 @@ class Qwen_PI(baseframework):
         while retaining the model-version-specific HF implementation.
         """
         input_ids = torch.zeros((1, sample.seq_len), dtype=torch.long)
-        attention_mask = torch.frombuffer(
-            bytearray(sample.attention_mask_u8), dtype=torch.uint8
+        attention_mask = torch.tensor(
+            tuple(sample.attention_mask_u8), dtype=torch.uint8
         ).reshape(1, sample.seq_len)
-        mm_token_types = torch.frombuffer(
-            bytearray(sample.mm_token_types_u8), dtype=torch.uint8
-        ).reshape(1, sample.seq_len)
+        mm_token_types = torch.zeros((1, sample.seq_len), dtype=torch.uint8)
+        if sample.image_token_positions:
+            mm_token_types[0, list(sample.image_token_positions)] = 1
         image_grid = torch.tensor(sample.image_grids, dtype=torch.long).reshape(-1, 3)
         position_ids, rope_deltas = inner.get_rope_index(
             input_ids=input_ids,
@@ -248,6 +273,8 @@ class Qwen_PI(baseframework):
     def _inject_cached_position_ids(self, qwen_inputs, layout):
         """Resolve per-sample MRoPE position ids *and* deltas from one cache."""
         if "position_ids" in qwen_inputs:
+            # Explicit caller positions bypass this cache; the caller also
+            # owns any matching RoPE state required by that override.
             return
         inner = getattr(getattr(self.qwen_vl_interface, "model", None), "model", None)
         if inner is None or not hasattr(inner, "get_rope_index"):
@@ -255,31 +282,25 @@ class Qwen_PI(baseframework):
         input_ids = qwen_inputs.get("input_ids")
         if input_ids is None:
             return
-        if tuple(input_ids.shape) != (layout.batch_size, layout.seq_len):
-            raise RuntimeError(
-                "Qwen metadata shape no longer matches input_ids: "
-                f"layout={(layout.batch_size, layout.seq_len)}, input={tuple(input_ids.shape)}"
-            )
-
-        device_key = self._device_key(input_ids.device)
+        target_device_key = device_key(input_ids)
         position_parts = []
         delta_parts = []
         for sample in layout.samples:
-            cache_key = (sample, device_key)
-            entry = self._metadata_cache.mrope_samples.get(cache_key)
-            if entry is None:
-                entry = self._build_mrope_entry(inner, sample, input_ids.device)
-                self._metadata_cache.mrope_samples.put(cache_key, entry)
+            cache_key = (sample, target_device_key)
+            entry = self._metadata_cache.mrope_samples.get_or_create(
+                cache_key,
+                lambda sample=sample: self._build_mrope_entry(
+                    inner, sample, input_ids.device
+                ),
+            )
             position_parts.append(entry.position_ids)
             delta_parts.append(entry.rope_deltas)
 
-        position_ids = torch.cat(position_parts, dim=1)
-        rope_deltas = torch.cat(delta_parts, dim=0)
-        qwen_inputs["position_ids"] = position_ids
+        qwen_inputs["position_ids"] = torch.cat(position_parts, dim=1)
         # ``rope_deltas`` is mutable state in HF Qwen3.5 and is returned to
         # callers.  It must be restored on every hit, not only computed on a
         # miss (the previous cache silently left a stale [1, 1] value).
-        inner.rope_deltas = rope_deltas
+        inner.rope_deltas = torch.cat(delta_parts, dim=0)
 
     def _check_precomputed_metadata(self, qwen_inputs):
         """Expensive opt-in guard against the stock full-batch HF result."""
@@ -384,20 +405,32 @@ class Qwen_PI(baseframework):
                     "examples['qwen_metadata'] must be a QwenBatchLayout, "
                     f"got {type(layout).__name__}"
                 )
+            if layout is not None:
+                self._validate_metadata_layout(layout, examples["qwen_inputs"])
             qwen_inputs = self._copy_qwen_inputs_to_device(
                 examples["qwen_inputs"], layout, device
             )
             backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-            if self._mrope_cache_enabled and layout is not None:
-                self._inject_cached_position_ids(qwen_inputs, layout)
+            metadata_layout = layout
+            if layout is not None and (
+                qwen_inputs.get("past_key_values") is not None
+                or qwen_inputs.get("use_cache") is True
+                or qwen_inputs.get("pixel_values_videos") is not None
+                or qwen_inputs.get("video_grid_thw") is not None
+            ):
+                # Structured metadata describes an image/text full prefill.
+                # Generation/cache and video calls retain stock HF behavior.
+                metadata_layout = None
+            if self._mrope_cache_enabled and metadata_layout is not None:
+                self._inject_cached_position_ids(qwen_inputs, metadata_layout)
                 self._check_precomputed_metadata(qwen_inputs)
             # Same bf16 autocast the legacy path applies inside
             # _encode_vl_hidden_states: the VLM backbone loads and trains in
             # bf16 (DeepSpeed bf16 mode); only the execution site of the HF
             # preprocessing differs between the two branches, not precision.
             metadata_context = (
-                activate_qwen_metadata(layout, self._metadata_cache)
-                if layout is not None
+                activate_qwen_metadata(metadata_layout, self._metadata_cache)
+                if metadata_layout is not None
                 else nullcontext()
             )
             with metadata_context:
