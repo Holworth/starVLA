@@ -425,3 +425,88 @@ def _patch_mm_merge():
 if os.environ.get("STARVLA_FAST_MM_MERGE"):
     _patch_mm_merge()
     print("[fused_text_stack_patch] sync-free mm merge (STARVLA_FAST_MM_MERGE)", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Index-based multimodal merge (STARVLA_INDEX_MM_MERGE=1).
+#
+# masked_scatter's BACKWARD runs grad.masked_select(mask) -> torch.nonzero,
+# which must count the mask's nonzeros and read that count back to the CPU:
+# one 4-byte DtoH + cudaStreamSynchronize per step, landing at the deepest
+# point of the backward queue. Measured on milestone1: the autograd thread
+# stalls ~63 ms behind the stream-7 backlog, freezing the ZeRO-2 bucket
+# hooks so allreduce buckets 4-6 pile up at the step tail (the direct cause
+# of the exposed-allreduce pattern). The sync-free forward-side merge
+# (STARVLA_FAST_MM_MERGE) only removed the forward validation readback - the
+# nonzero was deferred, not removed.
+#
+# Fix: image-token positions are a pure function of input_ids (known before
+# the step), so compute flat indices on the CPU from an input-only readback
+# (cached by input_ids bytes, like the MRoPE position-id cache) and merge
+# with index_copy - its backward is index_select: no nonzero, no sync.
+# Bonus: len(index) == image_embeds.shape[0] is a FREE host-side integer
+# check, restoring the count validation that FAST_MM_MERGE dropped.
+# ---------------------------------------------------------------------------
+
+
+def _patch_index_mm_merge():
+    _orig_model_forward = _m.Qwen3_5Model.forward
+
+    def _image_token_indices(self, input_ids):
+        cache = getattr(self, "_starvla_img_idx_cache", None)
+        if cache is None:
+            cache = self._starvla_img_idx_cache = {}
+        cpu_ids = input_ids.cpu()  # input-only readback, H2D already complete
+        key = cpu_ids.numpy().tobytes()
+        idx = cache.get(key)
+        if idx is None:
+            flat = (cpu_ids.view(-1) == self.config.image_token_id).nonzero(as_tuple=False).squeeze(1)
+            idx = flat.to(input_ids.device)
+            if len(cache) < 64:
+                cache[key] = idx
+        return idx
+
+    def _mm_forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None,
+                    inputs_embeds=None, pixel_values=None, pixel_values_videos=None, image_grid_thw=None,
+                    video_grid_thw=None, mm_token_type_ids=None, cache_position=None, **kwargs):
+        # Only the image-only training shape takes the fast path; anything
+        # else (embeds-only, video, generation) keeps stock behavior.
+        if input_ids is None or inputs_embeds is not None or pixel_values is None or pixel_values_videos is not None:
+            return _orig_model_forward(
+                self, input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids,
+                past_key_values=past_key_values, inputs_embeds=inputs_embeds, pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos, image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw, mm_token_type_ids=mm_token_type_ids,
+                cache_position=cache_position, **kwargs)
+
+        inputs_embeds = self.get_input_embeddings()(input_ids)
+        image_outputs = self.get_image_features(pixel_values, image_grid_thw, return_dict=True)
+        image_embeds = torch.cat(image_outputs.pooler_output, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+
+        idx = self._starvla_image_token_indices(input_ids)
+        if idx.numel() != image_embeds.shape[0]:  # host ints: free, sync-less validation
+            raise RuntimeError(
+                f"image token count ({idx.numel()}) != vision features ({image_embeds.shape[0]}); "
+                "processor/collate mismatch")
+        b, t, h = inputs_embeds.shape
+        inputs_embeds = inputs_embeds.view(-1, h).index_copy(0, idx, image_embeds).view(b, t, h)
+
+        if position_ids is None:
+            position_ids = self.compute_3d_position_ids(
+                input_ids=input_ids, image_grid_thw=image_grid_thw, video_grid_thw=video_grid_thw,
+                inputs_embeds=inputs_embeds, attention_mask=attention_mask,
+                past_key_values=past_key_values, mm_token_type_ids=mm_token_type_ids)
+
+        outputs = self.language_model(
+            input_ids=None, position_ids=position_ids, attention_mask=attention_mask,
+            past_key_values=past_key_values, inputs_embeds=inputs_embeds,
+            cache_position=cache_position, **kwargs)
+        return _m.Qwen3_5ModelOutputWithPast(**outputs, rope_deltas=self.rope_deltas)
+
+    _m.Qwen3_5Model._starvla_image_token_indices = _image_token_indices
+    _m.Qwen3_5Model.forward = _mm_forward
+
+
+if os.environ.get("STARVLA_INDEX_MM_MERGE"):
+    _patch_index_mm_merge()
+    print("[fused_text_stack_patch] index-based mm merge (STARVLA_INDEX_MM_MERGE)", flush=True)
