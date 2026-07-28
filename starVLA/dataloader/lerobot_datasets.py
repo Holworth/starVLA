@@ -6,7 +6,6 @@
 
 import logging
 from pathlib import Path
-from typing import Sequence
 from omegaconf import OmegaConf
 
 from starVLA.dataloader.gr00t_lerobot.datasets import LeRobotSingleDataset, LeRobotMixtureDataset
@@ -14,6 +13,11 @@ from starVLA.dataloader.gr00t_lerobot.registry import (
     ROBOT_TYPE_CONFIG_MAP,
     DATASET_NAMED_MIXTURES,
     EmbodimentTag,
+)
+from starVLA.model.qwenpi_metadata import (
+    build_qwen_batch_layout,
+    env_bool,
+    metadata_cache_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,6 +45,9 @@ class QwenVLPreprocessCollate:
         self, processor, cot_prompt=None, pixel_dtype=None, keep_examples=False, pad_to=0
     ):
         self.processor = processor
+        self._metadata_cache_enabled = metadata_cache_enabled()
+        self._metadata_config = None
+        self._metadata_compat_warning_emitted = False
         self.cot_prompt = cot_prompt
         self.pixel_dtype = pixel_dtype
         # [OPT #6/#10] Pad token sequences to a fixed length (left padding) so
@@ -52,6 +59,73 @@ class QwenVLPreprocessCollate:
         # eval_action_model) actually needs the raw batch.
         self.keep_examples = keep_examples
 
+    def _resolve_metadata_config(self):
+        """Resolve Qwen3.5 processor constants lazily for legacy compatibility."""
+
+        if self._metadata_config is not None:
+            return self._metadata_config
+
+        token_id = getattr(self.processor, "image_token_id", None)
+        if token_id is None:
+            tokenizer = getattr(self.processor, "tokenizer", None)
+            converter = getattr(tokenizer, "convert_tokens_to_ids", None)
+            if converter is None:
+                raise ValueError(
+                    "the processor exposes neither image_token_id nor a tokenizer "
+                    "with convert_tokens_to_ids('<|image_pad|>')"
+                )
+            token_id = converter("<|image_pad|>")
+
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            raise ValueError("processor.image_processor is missing")
+
+        merge_size = getattr(image_processor, "merge_size", None)
+        if merge_size is None:
+            merge_size = getattr(image_processor, "spatial_merge_size", None)
+        if merge_size is None:
+            raise ValueError(
+                "processor.image_processor exposes neither merge_size nor "
+                "spatial_merge_size"
+            )
+        self._metadata_config = (token_id, merge_size)
+        return self._metadata_config
+
+    def _build_metadata(self, qwen_inputs, image_counts):
+        """Build immutable CPU-only layout metadata for Qwen3.5 batches."""
+        import torch
+
+        def fallback(message, *args):
+            if not self._metadata_compat_warning_emitted:
+                logger.warning("[dataloader] " + message, *args)
+                self._metadata_compat_warning_emitted = True
+            return None
+
+        if "mm_token_type_ids" not in qwen_inputs:
+            return fallback(
+                "metadata cache needs Qwen3.5 mm_token_type_ids; using the stock path"
+            )
+        image_grid = qwen_inputs.get("image_grid_thw")
+        if torch.is_tensor(image_grid) and image_grid.dtype != torch.long:
+            return fallback(
+                "image_grid_thw has dtype %s; cached grid reconstruction requires "
+                "torch.int64, so this batch uses the stock path",
+                image_grid.dtype,
+            )
+        if any(
+            qwen_inputs.get(name) is not None
+            for name in ("pixel_values_videos", "video_grid_thw")
+        ):
+            return fallback("metadata caching is image/text only; using the stock video path")
+
+        image_token_id, spatial_merge_size = self._resolve_metadata_config()
+        return build_qwen_batch_layout(
+            qwen_inputs,
+            image_counts=image_counts,
+            image_token_id=image_token_id,
+            spatial_merge_size=spatial_merge_size,
+        )
+
     def __call__(self, batch):
         import numpy as np
         import torch
@@ -59,6 +133,7 @@ class QwenVLPreprocessCollate:
         import time as _time
 
         _t0 = _time.perf_counter()
+        image_counts = [len(ex["image"]) for ex in batch]
         messages = []
         for ex in batch:
             content = [{"type": "image", "image": img} for img in ex["image"]]
@@ -79,10 +154,10 @@ class QwenVLPreprocessCollate:
         # qwen_inputs = the HF processor's full output, a dict of pure torch
         # tensors: input_ids / attention_mask / mm_token_type_ids [B, T]
         # (left-padded to pad_to when set), pixel_values (patch sequences of
-        # ALL images in the batch, optionally pre-cast to bf16 below) and
-        # image_grid_thw [n_images, 3]. No raw PIL.Image / str survives past
-        # this point - Qwen_PI.forward's fast branch just splats this dict
-        # into the VLM after H2D.
+        # ALL images in the batch, optionally pre-cast to bf16 below) and,
+        # while qwen_metadata is built, image_grid_thw [n_images, 3]. The
+        # immutable grid tensor is then removed and reconstructed from the
+        # descriptor's per-rank GPU cache. No raw PIL.Image / str survives.
         qwen_inputs = dict(
             self.processor.apply_chat_template(
                 messages,
@@ -100,11 +175,22 @@ class QwenVLPreprocessCollate:
             "qwen_inputs": qwen_inputs,
             "actions": torch.from_numpy(np.stack([np.asarray(ex["action"]) for ex in batch])),
         }
+        if self._metadata_cache_enabled:
+            qwen_metadata = self._build_metadata(qwen_inputs, image_counts)
+            if qwen_metadata is not None:
+                # Keep the descriptor separate: qwen_inputs is splatted
+                # directly into the HF model and must remain tensor-only.
+                out["qwen_metadata"] = qwen_metadata
+                # The grid is immutable layout metadata. Removing its CPU
+                # tensor here prevents Accelerate from copying it to CUDA on
+                # every batch; Qwen_PI materializes one per-rank device copy
+                # from qwen_metadata and reuses it through the bounded cache.
+                qwen_inputs.pop("image_grid_thw")
         if self.keep_examples:
             out["examples"] = batch
         if "state" in batch[0]:
             out["state"] = torch.from_numpy(np.stack([np.asarray(ex["state"]) for ex in batch]))
-        if _os.environ.get("STARVLA_COLLATE_TIMING"):
+        if env_bool("STARVLA_COLLATE_TIMING"):
             print(
                 f"[collate] pid={_os.getpid()} t={_time.perf_counter():.3f} "
                 f"dur={(_time.perf_counter()-_t0)*1000:.1f}ms",

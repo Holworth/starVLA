@@ -34,6 +34,15 @@ DIT_DTYPE="${DIT_DTYPE:-bf16}"
 # MRoPE position-id cache (framework.qwenvl.mrope_posid_cache): true = the
 # measured config, MROPE_CACHE=false rolls back to HF per-step compute.
 MROPE_CACHE="${MROPE_CACHE:-true}"
+# Structured worker-layout + bounded per-rank GPU metadata caches. This one
+# switch rolls back MRoPE/ViT/split/index/causal-mask metadata consumers to
+# their stock HF paths for paired correctness runs.
+METADATA_CACHE="${METADATA_CACHE:-1}"
+FUSED_TEXT_STACK="${STARVLA_FUSED_TEXT_STACK:-1}"
+FUSED_VISION="${STARVLA_FUSED_VISION:-1}"
+INDEX_MM_MERGE="${STARVLA_INDEX_MM_MERGE:-1}"
+VIT_INPUT_CACHE="${STARVLA_VIT_INPUT_CACHE:-1}"
+BENCHMARK_WINDOW="${STARVLA_BENCHMARK_WINDOW:-0}"
 PROFILE_START_STEP="${PROFILE_START_STEP:-${START_STEP:-11}}"
 PROFILE_END_STEP="${PROFILE_END_STEP:-${END_STEP:-13}}"
 if (( PROFILE_END_STEP < PROFILE_START_STEP )); then
@@ -44,10 +53,36 @@ MAX_STEPS="${MAX_STEPS:-$((PROFILE_END_STEP + 1))}"
 PROFILE_RANKS="${PROFILE_RANKS:-all}"
 RUN_ID="${RUN_ID:-qwenpi_zero2_1node_bs${BS}_ranknsys_s${PROFILE_START_STEP}_e${PROFILE_END_STEP}_$(date +%Y%m%d_%H%M%S)}"
 
+env_enabled() {
+  case "${1,,}" in
+    ""|0|false|no|off) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+MROPE_CACHE_EFFECTIVE=0
+VISION_CACHE_EFFECTIVE=0
+INDEX_MM_EFFECTIVE=0
+if env_enabled "${METADATA_CACHE}"; then
+  if env_enabled "${MROPE_CACHE}"; then
+    MROPE_CACHE_EFFECTIVE=1
+  fi
+  if env_enabled "${FUSED_TEXT_STACK}" && env_enabled "${FUSED_VISION}" && env_enabled "${VIT_INPUT_CACHE}"; then
+    VISION_CACHE_EFFECTIVE=1
+  fi
+  if env_enabled "${FUSED_TEXT_STACK}" && env_enabled "${INDEX_MM_MERGE}"; then
+    INDEX_MM_EFFECTIVE=1
+  fi
+fi
+
 NSYS_HOST_DIR="${NSYS_HOST_DIR:-${PROJ}/tools/nsight-systems/extract/opt/nvidia/nsight-systems-cli}"
 NSYS_VERSION_DIR="${NSYS_VERSION_DIR:-2026.3.1}"
 NSYS_BIN="/opt/nvidia/nsight-systems/${NSYS_VERSION_DIR}/target-linux-x64/nsys"
 NSYS_TRACE="${NSYS_TRACE:-cuda,nvtx,cublas,cudnn,osrt}"
+# Graph-level tracing intentionally hides kernels inside CUDA Graph replays.
+# Node-level tracing costs more, but is required for a reviewable kernel
+# timeline and avoids malformed whole-graph intervals in Nsight 2026.3.
+NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE:-node}"
 NSYS_CAPTURE_MODE="${NSYS_CAPTURE_MODE:-cuda}"
 NSYS_NVTX_CAPTURE="${NSYS_NVTX_CAPTURE:-profile_window}"
 NSYS_CAPTURE_RANGE_END="${NSYS_CAPTURE_RANGE_END:-stop}"
@@ -72,11 +107,19 @@ EOF
   echo "run_id=${RUN_ID}"
   echo "gpus=${GPUS} per_gpu_batch=${BS} max_steps=${MAX_STEPS} grad_accum=${GRAD_ACCUM}"
   echo "dit_dtype=${DIT_DTYPE}"
+  echo "metadata_cache=${METADATA_CACHE}"
+  echo "mrope_cache_requested=${MROPE_CACHE} mrope_cache_effective=${MROPE_CACHE_EFFECTIVE}"
+  echo "fused_text_stack=${FUSED_TEXT_STACK} fused_vision=${FUSED_VISION}"
+  echo "vit_input_cache_requested=${VIT_INPUT_CACHE} vit_input_cache_effective=${VISION_CACHE_EFFECTIVE}"
+  echo "index_mm_requested=${INDEX_MM_MERGE} index_mm_effective=${INDEX_MM_EFFECTIVE}"
+  echo "profile_prebuild_seed=${STARVLA_PROFILE_PREBUILD_SEED:-}"
   echo "profile_window=${PROFILE_START_STEP}..${PROFILE_END_STEP}"
+  echo "benchmark_window=${BENCHMARK_WINDOW}"
   echo "profile_ranks=${PROFILE_RANKS}"
   echo "out_dir=${OUT_DIR}"
   echo "nsys=${NSYS_BIN}"
   echo "nsys_trace=${NSYS_TRACE}"
+  echo "nsys_cuda_graph_trace=${NSYS_CUDA_GRAPH_TRACE}"
   echo "nsys_capture_mode=${NSYS_CAPTURE_MODE} nvtx_capture=${NSYS_NVTX_CAPTURE}"
   echo "nsys_capture_range_end=${NSYS_CAPTURE_RANGE_END} kill=${NSYS_KILL}"
   echo "nsys_cuda_memory_usage=${NSYS_CUDA_MEMORY_USAGE}"
@@ -95,26 +138,30 @@ ENROOT_MOUNT_HOME=no enroot start --rw \
   --env WANDB_MODE=disabled --env PYTHONWARNINGS=ignore \
   --env HF_HOME=/model/huggingface --env HF_HUB_CACHE=/model/huggingface/hub \
   --env PYTHONPATH=/scripts/starvla \
+  --env STARVLA_METADATA_CACHE="${METADATA_CACHE}" \
+  --env STARVLA_CHECK_METADATA_CACHE="${STARVLA_CHECK_METADATA_CACHE:-}" \
+  --env STARVLA_PROFILE_PREBUILD_SEED="${STARVLA_PROFILE_PREBUILD_SEED:-}" \
   --env STARVLA_CHECK_POSIDS="${STARVLA_CHECK_POSIDS:-}" \
   --env STARVLA_EMIT_NVTX="${STARVLA_EMIT_NVTX:-}" \
   --env STARVLA_NVTX_ACTION_HEAD="${STARVLA_NVTX_ACTION_HEAD:-}" \
-  --env STARVLA_FUSED_TEXT_STACK=1 \
+  --env STARVLA_FUSED_TEXT_STACK="${FUSED_TEXT_STACK}" \
   --env STARVLA_FLA_TRACE=1 \
   --env STARVLA_FUSED_GROUP_SIZE=8 \
   --env STARVLA_FUSED_COMPILE_MODE=reduce-overhead \
-  --env STARVLA_FUSED_VISION=1 \
-  --env STARVLA_FAST_MM_MERGE=1 \
-  --env STARVLA_INDEX_MM_MERGE=1 \
-  --env STARVLA_VIT_INPUT_CACHE="${STARVLA_VIT_INPUT_CACHE:-1}" \
+  --env STARVLA_FUSED_VISION="${FUSED_VISION}" \
+  --env STARVLA_INDEX_MM_MERGE="${INDEX_MM_MERGE}" \
+  --env STARVLA_VIT_INPUT_CACHE="${VIT_INPUT_CACHE}" \
   --env STARVLA_CONV_TORCH_FALLBACK="${STARVLA_CONV_TORCH_FALLBACK:-}" \
   --env STARVLA_PROFILE_START_STEP="${PROFILE_START_STEP}" \
   --env STARVLA_PROFILE_END_STEP="${PROFILE_END_STEP}" \
+  --env STARVLA_BENCHMARK_WINDOW="${BENCHMARK_WINDOW}" \
   --env STARVLA_PROFILE_TRIGGER="${NSYS_CAPTURE_MODE}" \
   --env STARVLA_PROFILE_RANKS="${PROFILE_RANKS}" \
   --env STARVLA_NSYS_RUN_ID="${RUN_ID}" \
   --env STARVLA_NSYS_OUT_DIR="${OUT_DIR_IN}" \
   --env STARVLA_NSYS_BIN="${NSYS_BIN}" \
   --env STARVLA_NSYS_TRACE="${NSYS_TRACE}" \
+  --env STARVLA_NSYS_CUDA_GRAPH_TRACE="${NSYS_CUDA_GRAPH_TRACE}" \
   --env STARVLA_NSYS_CAPTURE_MODE="${NSYS_CAPTURE_MODE}" \
   --env STARVLA_NSYS_NVTX_CAPTURE="${NSYS_NVTX_CAPTURE}" \
   --env STARVLA_NSYS_CAPTURE_RANGE_END="${NSYS_CAPTURE_RANGE_END}" \

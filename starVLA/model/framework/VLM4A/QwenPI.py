@@ -7,6 +7,7 @@ A lightweight implementation that Qwen2.5-vl + Flow-matching head to directly pr
 Flow-matching header is copyright from GR00T N1.5, but a sample MoE inspired by PI_0
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -26,6 +27,15 @@ from starVLA.model.framework.base_framework import baseframework
 from starVLA.model.framework.share_tools import merge_framework_config, populate_layerwise_dit_cfg
 from starVLA.model.modules.action_model.LayerwiseFM_ActionHeader import LayerwiseFlowmatchingActionHead, get_action_model
 from starVLA.model.modules.vlm import get_vlm_model
+from starVLA.model.qwenpi_metadata import (
+    MRoPEEntry,
+    QwenBatchLayout,
+    QwenMetadataCache,
+    activate_qwen_metadata,
+    device_key,
+    env_bool,
+    metadata_cache_enabled,
+)
 from starVLA.model.tools import FRAMEWORK_REGISTRY
 from starVLA.training.trainer_utils.trainer_tools import resize_images
 
@@ -164,143 +174,174 @@ class Qwen_PI(baseframework):
         # only ever read `action_horizon` here.
         self.action_horizon = int(self.config.framework.action_model.action_horizon)
 
-        # [OPT mrope-cache] Cache the 3D MRoPE position ids across steps
-        # (framework.qwenvl.mrope_posid_cache). HF recomputes them every
-        # forward via a per-sample python loop with 3x .item() per image —
-        # ~150 GPU syncs / ~13 ms of serialized host time per step. The ids
-        # are a pure function of (mm_token_type_ids, attention_mask,
-        # image_grid_thw) — sequence structure only, no weights, no token
-        # values — so identical inputs (fixed collate_pad_to + fixed camera
-        # resolutions => a handful of distinct keys) can reuse the cached
-        # GPU tensor; HF skips its own compute whenever position_ids is
-        # not None. Verify anytime with STARVLA_CHECK_POSIDS=1.
-        self._mrope_cache_enabled = (
-            str(self.config.framework.qwenvl.get("mrope_posid_cache", False)).lower() in ("true", "1")
+        # The worker emits an immutable, CPU-only layout descriptor.  A
+        # single per-model cache then owns every device-side tensor derived
+        # from that layout (MRoPE, ViT structure, image indices and masks).
+        # Keeping this manager here gives each process/rank its own bounded
+        # cache and avoids attaching ad-hoc dictionaries to HF submodules.
+        self._metadata_cache_enabled = metadata_cache_enabled()
+        self._metadata_cache = QwenMetadataCache()
+        mrope_cache_requested = (
+            str(self.config.framework.qwenvl.get("mrope_posid_cache", False))
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
         )
-        self._mrope_posid_cache = {}
+        self._mrope_cache_enabled = (
+            self._metadata_cache_enabled and mrope_cache_requested
+        )
+        if mrope_cache_requested and not self._metadata_cache_enabled:
+            logger.warning(
+                "Qwen MRoPE caching was requested, but STARVLA_METADATA_CACHE "
+                "is disabled; falling back to Hugging Face MRoPE computation."
+            )
 
-    def _inject_cached_position_ids(self, qwen_inputs):
-        """[OPT mrope-cache] Fill qwen_inputs["position_ids"] from the cache,
-        computing once per distinct (mm_token_type_ids, attention_mask,
-        image_grid_thw) via the model's OWN compute_3d_position_ids (so the
-        semantics always match the loaded model — no cross-variant risk).
-        The key readbacks touch pure input tensors (already H2D-complete),
-        so they cost ~µs of API time, not a GPU pipeline drain."""
-        if "position_ids" in qwen_inputs:
-            return
+    def _validate_metadata_layout(self, layout, qwen_inputs):
+        """Reject a processor descriptor incompatible with the loaded model."""
+
         input_ids = qwen_inputs.get("input_ids")
-        mm_tt = qwen_inputs.get("mm_token_type_ids")
-        grid = qwen_inputs.get("image_grid_thw")
-        mask = qwen_inputs.get("attention_mask")
-        if input_ids is None or mm_tt is None or grid is None:
+        expected_shape = (layout.batch_size, layout.seq_len)
+        if not torch.is_tensor(input_ids) or tuple(input_ids.shape) != expected_shape:
+            actual_shape = tuple(input_ids.shape) if torch.is_tensor(input_ids) else None
+            raise RuntimeError(
+                "Qwen metadata shape does not match input_ids: "
+                f"descriptor={expected_shape}, tensor={actual_shape}"
+            )
+        inner = self.qwen_vl_interface.model.model
+        model_merge_size = int(inner.config.vision_config.spatial_merge_size)
+        if layout.spatial_merge_size != model_merge_size:
+            raise RuntimeError(
+                "Qwen metadata spatial_merge_size does not match the model: "
+                f"descriptor={layout.spatial_merge_size}, model={model_merge_size}"
+            )
+
+    def _copy_qwen_inputs_to_device(self, cpu_inputs, layout, device):
+        """Copy dynamic inputs and reuse layout-only grid tensors.
+
+        ``image_grid_thw`` is immutable metadata.  Reconstructing it from the
+        worker descriptor on a cache miss avoids a GPU readback key; later
+        steps reuse the exact device tensor.
+        """
+        qwen_inputs = {}
+        for key, value in cpu_inputs.items():
+            if key == "image_grid_thw" and layout is not None:
+                continue
+            qwen_inputs[key] = (
+                value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+            )
+        if layout is not None:
+            grids = layout.vision.grids
+            cache_key = (grids, device_key(device))
+            device_grid = self._metadata_cache.grid_tensors.get_or_create(
+                cache_key,
+                lambda: torch.tensor(
+                    grids,
+                    dtype=torch.long,
+                    device=device,
+                ).reshape(-1, 3),
+            )
+            qwen_inputs["image_grid_thw"] = device_grid
+        return qwen_inputs
+
+    def _build_mrope_entry(self, inner, sample, device):
+        """Run HF's own Qwen3.5 MRoPE algorithm on CPU for one sample.
+
+        Token values are irrelevant to ``get_rope_index``; only sequence
+        length, mask, modality runs and ordered grids are used.  Rebuilding
+        those immutable inputs on CPU keeps the miss path free of D2H syncs
+        while retaining the model-version-specific HF implementation.
+        """
+        input_ids = torch.zeros((1, sample.seq_len), dtype=torch.long)
+        attention_mask = torch.tensor(
+            tuple(sample.attention_mask_u8), dtype=torch.uint8
+        ).reshape(1, sample.seq_len)
+        mm_token_types = torch.zeros((1, sample.seq_len), dtype=torch.uint8)
+        if sample.image_token_positions:
+            mm_token_types[0, list(sample.image_token_positions)] = 1
+        image_grid = torch.tensor(sample.image_grids, dtype=torch.long).reshape(-1, 3)
+        position_ids, rope_deltas = inner.get_rope_index(
+            input_ids=input_ids,
+            mm_token_type_ids=mm_token_types,
+            image_grid_thw=image_grid,
+            attention_mask=attention_mask,
+        )
+        return MRoPEEntry(
+            position_ids=position_ids.to(device, non_blocking=True),
+            rope_deltas=rope_deltas.to(device, non_blocking=True),
+        )
+
+    def _inject_cached_position_ids(self, qwen_inputs, layout):
+        """Resolve per-sample MRoPE position ids *and* deltas from one cache."""
+        if "position_ids" in qwen_inputs:
+            # Explicit caller positions bypass this cache; the caller also
+            # owns any matching RoPE state required by that override.
             return
         inner = getattr(getattr(self.qwen_vl_interface, "model", None), "model", None)
-        if inner is None or not hasattr(inner, "compute_3d_position_ids"):
+        if inner is None or not hasattr(inner, "get_rope_index"):
             return
-        mm_cpu = mm_tt.cpu().numpy()
-        mask_cpu = mask.cpu().numpy() if mask is not None else None
-        grid_cpu = grid.cpu().numpy()
-        key = (
-            mm_cpu.tobytes(),
-            mask_cpu.tobytes() if mask_cpu is not None else b"",
-            grid_cpu.tobytes(),
-        )
-        pos = self._mrope_posid_cache.get(key)
-        if pos is None:
-            # Batch-key miss. At small bs the batch key repeats and this is
-            # rare; at bs>=24 the key is a new combination of per-sample
-            # instruction lengths nearly every step, so the batch cache
-            # silently degrades to per-step misses (HF's stock per-sample
-            # loop: ~60 ms/step at bs32, 579 D2H readbacks + ~1.5k tiny
-            # kernels). position ids are computed independently per sample
-            # inside HF's loop, so cache at SAMPLE granularity (per-sample
-            # keys DO repeat: one instruction x a fixed image layout) and
-            # assemble the batch with a single cat.
-            pos = self._assemble_posids_per_sample(
-                inner, input_ids, mm_tt, mask, grid, mm_cpu, mask_cpu, grid_cpu
-            )
-            if pos is None:
-                # Non-uniform images/sample or sample compute declined:
-                # stock full-batch fallback (original PR#10 behavior).
-                pos = inner.compute_3d_position_ids(
-                    input_ids=input_ids,
-                    inputs_embeds=None,
-                    image_grid_thw=grid,
-                    attention_mask=mask,
-                    mm_token_type_ids=mm_tt,
-                )
-            if pos is None:
-                return
-            if len(self._mrope_posid_cache) < 64:
-                self._mrope_posid_cache[key] = pos
-        qwen_inputs["position_ids"] = pos
-
-    def _assemble_posids_per_sample(
-        self, inner, input_ids, mm_tt, mask, grid, mm_cpu, mask_cpu, grid_cpu
-    ):
-        """[OPT mrope-cache] Sample-granularity position-id cache. Requires a
-        uniform images-per-sample layout to map grid rows to samples (true
-        for this workload; returns None otherwise so the caller falls back).
-        Per-sample results come from the model's OWN compute_3d_position_ids
-        on 1-sample slices, so semantics match HF exactly; the batch is
-        rebuilt with one cat along dim=1 ([3, B, S])."""
-        B = input_ids.shape[0]
-        n_img = grid.shape[0]
-        if B == 0 or n_img % B != 0:
-            return None
-        ipp = n_img // B
-        cache = getattr(self, "_mrope_sample_cache", None)
-        if cache is None:
-            cache = self._mrope_sample_cache = {}
-        parts = []
-        for i in range(B):
-            skey = (
-                mm_cpu[i].tobytes(),
-                mask_cpu[i].tobytes() if mask_cpu is not None else b"",
-                grid_cpu[i * ipp : (i + 1) * ipp].tobytes(),
-            )
-            p = cache.get(skey)
-            if p is None:
-                p = inner.compute_3d_position_ids(
-                    input_ids=input_ids[i : i + 1],
-                    inputs_embeds=None,
-                    image_grid_thw=grid[i * ipp : (i + 1) * ipp],
-                    attention_mask=mask[i : i + 1] if mask is not None else None,
-                    mm_token_type_ids=mm_tt[i : i + 1],
-                )
-                if p is None:
-                    return None
-                if len(cache) < 4096:
-                    cache[skey] = p
-            parts.append(p)
-        return torch.cat(parts, dim=1)
-
-    def _check_precomputed_position_ids(self, qwen_inputs):
-        """[OPT mrope-cache] Debug guard (STARVLA_CHECK_POSIDS=1): recompute
-        the 3D MRoPE position ids with the stock HF path and assert the
-        cached ones are identical. Costs the ~13 ms/step this optimization
-        removes, so only enable for validation runs."""
-        import os
-
-        if not os.environ.get("STARVLA_CHECK_POSIDS") or "position_ids" not in qwen_inputs:
+        input_ids = qwen_inputs.get("input_ids")
+        if input_ids is None:
             return
-        ref = self.qwen_vl_interface.model.model.compute_3d_position_ids(
-            input_ids=qwen_inputs.get("input_ids"),
-            inputs_embeds=None,
-            image_grid_thw=qwen_inputs.get("image_grid_thw"),
-            attention_mask=qwen_inputs.get("attention_mask"),
-            mm_token_type_ids=qwen_inputs.get("mm_token_type_ids"),
-        )
-        # Explicit raise (not assert): must not be strippable by python -O,
-        # and the OK line below must never print without the comparison.
-        if ref is None or not torch.equal(ref, qwen_inputs["position_ids"]):
-            raise RuntimeError(
-                "cached MRoPE position_ids != HF compute_3d_position_ids "
-                f"(shapes {qwen_inputs['position_ids'].shape} vs {None if ref is None else ref.shape})"
+        target_device_key = device_key(input_ids)
+        position_parts = []
+        delta_parts = []
+        for sample in layout.samples:
+            cache_key = (sample, target_device_key)
+            entry = self._metadata_cache.mrope_samples.get_or_create(
+                cache_key,
+                lambda sample=sample: self._build_mrope_entry(
+                    inner, sample, input_ids.device
+                ),
             )
-        if not getattr(self, "_posids_check_logged", False):
-            print("[QwenPI] STARVLA_CHECK_POSIDS: cached position_ids == HF compute OK", flush=True)
-            self._posids_check_logged = True
+            position_parts.append(entry.position_ids)
+            delta_parts.append(entry.rope_deltas)
+
+        qwen_inputs["position_ids"] = torch.cat(position_parts, dim=1)
+        # ``rope_deltas`` is mutable state in HF Qwen3.5 and is returned to
+        # callers.  It must be restored on every hit, not only computed on a
+        # miss (the previous cache silently left a stale [1, 1] value).
+        inner.rope_deltas = torch.cat(delta_parts, dim=0)
+
+    def _check_precomputed_metadata(self, qwen_inputs):
+        """Expensive opt-in guard against the stock full-batch HF result."""
+        enabled = env_bool("STARVLA_CHECK_METADATA_CACHE") or env_bool(
+            "STARVLA_CHECK_POSIDS"
+        )
+        if not enabled or "position_ids" not in qwen_inputs:
+            return
+        inner = self.qwen_vl_interface.model.model
+        cached_position_ids = qwen_inputs["position_ids"]
+        cached_rope_deltas = inner.rope_deltas
+        try:
+            reference_position_ids = inner.compute_3d_position_ids(
+                input_ids=qwen_inputs.get("input_ids"),
+                inputs_embeds=None,
+                image_grid_thw=qwen_inputs.get("image_grid_thw"),
+                attention_mask=qwen_inputs.get("attention_mask"),
+                mm_token_type_ids=qwen_inputs.get("mm_token_type_ids"),
+            )
+            reference_rope_deltas = inner.rope_deltas
+            position_ok = reference_position_ids is not None and torch.equal(
+                reference_position_ids, cached_position_ids
+            )
+            deltas_ok = reference_rope_deltas is not None and torch.equal(
+                reference_rope_deltas, cached_rope_deltas
+            )
+            if not position_ok or not deltas_ok:
+                raise RuntimeError(
+                    "cached Qwen metadata != HF reference "
+                    f"(position_ids={position_ok}, rope_deltas={deltas_ok})"
+                )
+        finally:
+            # The reference call mutates HF state; preserve the resolved
+            # cache value even if the comparison raises.
+            inner.rope_deltas = cached_rope_deltas
+        if not getattr(self, "_metadata_check_logged", False):
+            print(
+                "[QwenPI] metadata cache: position_ids and rope_deltas match HF",
+                flush=True,
+            )
+            self._metadata_check_logged = True
 
     def _encode_vl_hidden_states(
         self, batch_images: List, instructions: List[str]
@@ -358,27 +399,50 @@ class Qwen_PI(baseframework):
         if isinstance(examples, dict) and "qwen_inputs" in examples:
             # Pre-collated path: only H2D copies + VLM forward on the main thread.
             device = self.qwen_vl_interface.model.device
-            qwen_inputs = {
-                k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
-                for k, v in examples["qwen_inputs"].items()
-            }
+            layout = examples.get("qwen_metadata") if self._metadata_cache_enabled else None
+            if layout is not None and not isinstance(layout, QwenBatchLayout):
+                raise TypeError(
+                    "examples['qwen_metadata'] must be a QwenBatchLayout, "
+                    f"got {type(layout).__name__}"
+                )
+            if layout is not None:
+                self._validate_metadata_layout(layout, examples["qwen_inputs"])
+            qwen_inputs = self._copy_qwen_inputs_to_device(
+                examples["qwen_inputs"], layout, device
+            )
             backbone_attention_mask = qwen_inputs.get("attention_mask", None)
-            if self._mrope_cache_enabled:
-                self._inject_cached_position_ids(qwen_inputs)
-                self._check_precomputed_position_ids(qwen_inputs)
+            metadata_layout = layout
+            if layout is not None and (
+                qwen_inputs.get("past_key_values") is not None
+                or qwen_inputs.get("use_cache") is True
+                or qwen_inputs.get("pixel_values_videos") is not None
+                or qwen_inputs.get("video_grid_thw") is not None
+            ):
+                # Structured metadata describes an image/text full prefill.
+                # Generation/cache and video calls retain stock HF behavior.
+                metadata_layout = None
+            if self._mrope_cache_enabled and metadata_layout is not None:
+                self._inject_cached_position_ids(qwen_inputs, metadata_layout)
+                self._check_precomputed_metadata(qwen_inputs)
             # Same bf16 autocast the legacy path applies inside
             # _encode_vl_hidden_states: the VLM backbone loads and trains in
             # bf16 (DeepSpeed bf16 mode); only the execution site of the HF
             # preprocessing differs between the two branches, not precision.
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                qwenvl_outputs = self.qwen_vl_interface(
-                    **qwen_inputs,
-                    output_attentions=False,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-                expected_layers = len(self.action_model.model.transformer_blocks)
-                vl_embs_list = list(qwenvl_outputs.hidden_states[-expected_layers:])
+            metadata_context = (
+                activate_qwen_metadata(metadata_layout, self._metadata_cache)
+                if metadata_layout is not None
+                else nullcontext()
+            )
+            with metadata_context:
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    qwenvl_outputs = self.qwen_vl_interface(
+                        **qwen_inputs,
+                        output_attentions=False,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    expected_layers = len(self.action_model.model.transformer_blocks)
+                    vl_embs_list = list(qwenvl_outputs.hidden_states[-expected_layers:])
             base_hidden = vl_embs_list[-1]
             actions = examples["actions"].to(device, dtype=base_hidden.dtype, non_blocking=True)
             state = examples.get("state", None)
