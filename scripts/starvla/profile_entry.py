@@ -14,6 +14,11 @@ if env_bool("STARVLA_FUSED_TEXT_STACK"):
 else:
     print("[profile_entry] fused text stack disabled", flush=True)
 
+if env_bool("STARVLA_DS_FAST_GRAD_NORM", default=True):
+    import ds_grad_norm_patch  # noqa: F401  (multi-tensor ZeRO grad norm)
+else:
+    print("[profile_entry] ds fast grad norm disabled", flush=True)
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_yaml", type=str, required=True)
 args, clip = parser.parse_known_args()
