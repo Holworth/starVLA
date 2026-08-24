@@ -94,6 +94,26 @@ class QwenPIDefaultConfig:
             # "bfloat16" runs the DiT on tensor cores like the VLM does and is
             # substantially faster on Ampere+ GPUs; see PR benchmarks.
             "autocast_dtype": "float32",
+            # CUDA-graph execution of the training-time DiT forward
+            # (torch.compile reduce-overhead + encoder-length bucketing).
+            # Anything the buckets cannot serve falls back to the eager module
+            # (out-of-range lengths, compile failures, gradient accumulation
+            # without per-microbatch grad clearing — see the restrictions in
+            # action_model/dit_graph_compile.py).
+            "compile": False,
+            # Encoder length is padded up to a multiple of this (padded keys
+            # are masked out of cross-attention, numerically a no-op).
+            "compile_bucket_multiple": 64,
+            # Sequences longer than this run eagerly (bounds graph count/memory).
+            "compile_max_capture_len": 1024,
+            # Optional explicit capture lengths (overrides the bucket multiple),
+            # e.g. [192, 384]; mirrors vLLM's cudagraph_capture_sizes.
+            "compile_capture_lens": None,
+            # After this many successful compiled calls, run any further
+            # recompile-triggering call eagerly instead of paying a ~20s
+            # compilation stall (torch.compiler eager_on_recompile stance).
+            # 0 disables the freeze.
+            "compile_freeze_after": 4,
             # DiT architecture settings — shape fields (num_layers,
             # input_embedding_dim, cross_attention_dim, num_attention_heads)
             # are auto-populated by populate_layerwise_dit_cfg at runtime.
