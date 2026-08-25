@@ -65,6 +65,59 @@ def test_collate_matches_in_forward_path():
 
 
 @needs_model
+def test_collate_pad_to_fixed_length():
+    batch = make_batch()
+    free = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT)(batch)
+    fixed = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT, pad_to=192)(batch)
+    assert fixed["input_ids"].shape[1] == 192 > free["input_ids"].shape[1]
+    assert torch.equal(fixed["attention_mask"].sum(1), free["attention_mask"].sum(1))
+    n = free["input_ids"].shape[1]
+    assert torch.equal(fixed["input_ids"][:, -n:], free["input_ids"][:, -n:])  # left-padded
+
+
+@needs_model
+def test_collate_pad_to_matches_processor_maxlen():
+    """Manual left-padding must be byte-identical to the processor's own
+    max_length padding (guards the hand-pad against tokenizer drift)."""
+    from starVLA.model.modules.vlm.qwenvl_messages import build_qwenvl_messages
+    from transformers import AutoProcessor
+
+    batch = make_batch()
+    out = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT, pad_to=192)(batch)
+    proc = AutoProcessor.from_pretrained(MODEL_DIR)
+    proc.tokenizer.padding_side = "left"
+    ref = proc.apply_chat_template(
+        build_qwenvl_messages([ex["image"] for ex in batch], [ex["lang"] for ex in batch], COT),
+        tokenize=True, padding="max_length", max_length=192,
+        add_generation_prompt=True, return_dict=True, return_tensors="pt",
+    )
+    for key in ("input_ids", "attention_mask"):
+        assert torch.equal(out[key], ref[key]), key
+
+
+@needs_model
+def test_collate_pad_to_too_short_falls_back():
+    batch = make_batch()
+    ref = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT)(batch)
+    short = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT, pad_to=8)
+    out = short(batch)
+    assert "too_long" in short._warned  # warned once, batch keeps dynamic length
+    assert torch.equal(out["input_ids"], ref["input_ids"])
+
+
+@needs_model
+def test_singleton_batch_skips_fixed_pad():
+    """Qwen3.5's linear-attention mask gate ignores padding when B == 1
+    (transformers #46773), so fixed padding must be skipped for singletons."""
+    batch = make_batch(n=1)
+    c = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT, pad_to=192)
+    out = c(batch)
+    free = QwenPIPreprocessCollate(MODEL_DIR, cot_prompt=COT)(batch)
+    assert out["input_ids"].shape == free["input_ids"].shape  # no pads added
+    assert "singleton" in c._warned
+
+
+@needs_model
 def test_text_only_batch_has_no_pixel_values():
     batch = make_batch()
     for ex in batch:

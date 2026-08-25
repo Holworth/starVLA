@@ -179,6 +179,7 @@ class Qwen_PI(baseframework):
         return QwenPIPreprocessCollate(
             base_vlm=base_vlm,
             cot_prompt=vla.get("CoT_prompt", None) if "CoT_prompt" in vla else None,
+            pad_to=vla.get("collate_pad_to", 0),
             obs_image_size=vla.get("obs_image_size", None),
         )
 
